@@ -19,8 +19,11 @@ def initialize(connection: sqlite3.Connection) -> None:
             call_id TEXT PRIMARY KEY,
             archive_path TEXT NOT NULL,
             source_filename TEXT NOT NULL,
+            source_path TEXT NULL,
             sha256 TEXT NOT NULL UNIQUE,
             recorded_at TEXT NULL,
+            recorded_at_source TEXT NULL,
+            recorded_at_confidence TEXT NULL,
             imported_at TEXT NOT NULL,
             duration_seconds REAL NULL,
             audio_format TEXT NULL,
@@ -79,10 +82,55 @@ def initialize(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS speaker_profiles (
+            speaker_identity_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            notes TEXT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS speaker_embeddings (
+            embedding_id TEXT PRIMARY KEY,
+            speaker_identity_id TEXT NULL,
+            call_id TEXT NOT NULL,
+            speaker_cluster_id TEXT NOT NULL,
+            segment_count INTEGER NOT NULL,
+            duration_seconds REAL NOT NULL,
+            embedding_vector_json TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            confidence REAL NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS speaker_assignments (
+            assignment_id TEXT PRIMARY KEY,
+            call_id TEXT NOT NULL,
+            speaker_cluster_id TEXT NOT NULL,
+            speaker_identity_id TEXT NULL,
+            assignment_source TEXT NOT NULL,
+            match_score REAL NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_calls_state ON calls(current_state, review_state);
         CREATE INDEX IF NOT EXISTS idx_calls_imported_at ON calls(imported_at);
         CREATE INDEX IF NOT EXISTS idx_tasks_call_id ON tasks(call_id, status, is_reviewed);
         CREATE INDEX IF NOT EXISTS idx_queue_jobs_status ON queue_jobs(status, priority, available_at);
+        CREATE INDEX IF NOT EXISTS idx_speaker_embeddings_call_cluster ON speaker_embeddings(call_id, speaker_cluster_id);
+        CREATE INDEX IF NOT EXISTS idx_speaker_assignments_call_cluster ON speaker_assignments(call_id, speaker_cluster_id);
+        CREATE INDEX IF NOT EXISTS idx_speaker_profiles_status_name ON speaker_profiles(status, display_name);
         """
     )
+    _ensure_column(connection, "calls", "source_path", "TEXT NULL")
+    _ensure_column(connection, "calls", "recorded_at_source", "TEXT NULL")
+    _ensure_column(connection, "calls", "recorded_at_confidence", "TEXT NULL")
     connection.commit()
+
+
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")

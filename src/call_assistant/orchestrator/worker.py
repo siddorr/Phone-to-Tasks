@@ -13,19 +13,36 @@ from call_assistant.common.models import AnalysisBundle, artifact_paths
 from call_assistant.diarization.service import diarize
 from call_assistant.indexing.service import index_call
 from call_assistant.ingest.watcher import detect_new_calls
-from call_assistant.orchestrator.queue import claim_next_job, complete_job, enqueue, fail_job
+from call_assistant.orchestrator.queue import claim_next_job, complete_job, enqueue, fail_job, reset_running_jobs_on_startup
+from call_assistant.speaker_identity.service import run_speaker_identity_stage
 from call_assistant.transcript_cleaner.service import clean_transcript
-from call_assistant.transcription.service import transcribe
+from call_assistant.transcription.service import _looks_mixed_language_problem, _transcription_preferences, transcribe
 
 logger = logging.getLogger(__name__)
 
 STAGE_SEQUENCE = {
     "audio_prepare": "transcription",
     "transcription": "diarization",
-    "diarization": "transcript_clean",
+    "diarization": "speaker_identity",
+    "speaker_identity": "transcript_clean",
     "transcript_clean": "analysis",
     "analysis": "indexing",
 }
+
+IN_PROGRESS_STATE = {
+    "audio_prepare": "preparing_audio",
+    "transcription": "transcribing",
+    "diarization": "diarizing",
+    "speaker_identity": "resolving_speaker_identity",
+    "transcript_clean": "cleaning_transcript",
+    "analysis": "analyzing",
+    "indexing": "indexing",
+}
+
+
+def processing_mode(config: AppConfig) -> str:
+    mode = str(config.section("processing").get("startup_mode", "automatic")).strip().lower()
+    return mode if mode in {"automatic", "manual_step"} else "automatic"
 
 
 def _call_dir(config: AppConfig, call_id: str) -> Path:
@@ -65,10 +82,22 @@ def _process_audio_prepare(config: AppConfig, call_dir: Path) -> None:
 
 def _process_transcription(config: AppConfig, call_dir: Path) -> None:
     logger.info("Stage transcription start call_dir=%s", call_dir)
-    raw = transcribe(call_dir / "audio_normalized.wav", config)
+    audio_path = call_dir / "audio_normalized.wav"
+    default_provider, model_override, language_override, language_mode = _transcription_preferences(audio_path, config)
+    raw = transcribe(audio_path, config)
     write_json(call_dir / "transcript_raw.json", raw)
     low_confidence = not raw.segments
-    metadata = _update_metadata(call_dir, current_state="transcribed", low_confidence=low_confidence)
+    metadata = _update_metadata(
+        call_dir,
+        current_state="transcribed",
+        low_confidence=low_confidence,
+        transcription_provider=raw.provider,
+        transcription_model=raw.model,
+        transcription_language_detected=raw.language,
+        transcription_language_override=language_override,
+        transcription_language_mode=language_mode,
+        mixed_language_suspected=_looks_mixed_language_problem(raw, audio_path),
+    )
     _sync_call_row(config, call_dir)
     logger.info("Stage transcription success call_dir=%s provider=%s segments=%s", call_dir, raw.provider, len(raw.segments))
 
@@ -118,8 +147,6 @@ def transcribe_data_to_segments(
 
 
 def _process_transcript_clean(config: AppConfig, call_dir: Path) -> None:
-    from call_assistant.common.models import TranscriptSegment
-
     logger.info("Stage transcript_clean start call_dir=%s", call_dir)
     payload = read_json(call_dir / "transcript_segments.json", default=[])
     segments = [TranscriptSegment(**item) for item in payload]
@@ -128,6 +155,14 @@ def _process_transcript_clean(config: AppConfig, call_dir: Path) -> None:
     metadata = _update_metadata(call_dir, current_state="transcript_clean")
     _sync_call_row(config, call_dir)
     logger.info("Stage transcript_clean success call_dir=%s segment_count=%s", call_dir, len(segments))
+
+
+def _process_speaker_identity(config: AppConfig, call_dir: Path) -> None:
+    logger.info("Stage speaker_identity start call_dir=%s", call_dir)
+    updated = run_speaker_identity_stage(config, call_dir)
+    _update_metadata(call_dir, current_state="speaker_identity")
+    _sync_call_row(config, call_dir)
+    logger.info("Stage speaker_identity success call_dir=%s segments=%s", call_dir, len(updated))
 
 
 def _process_analysis(config: AppConfig, call_dir: Path) -> None:
@@ -161,6 +196,10 @@ def _process_indexing(config: AppConfig, call_dir: Path) -> None:
 
 def process_job(config: AppConfig, job) -> None:
     call_dir = _call_dir(config, job.call_id)
+    current_state = IN_PROGRESS_STATE.get(job.stage)
+    if current_state:
+        _update_metadata(call_dir, current_state=current_state)
+        _sync_call_row(config, call_dir)
     append_log(call_dir / "processing_log.json", {"event": f"{job.stage}_started", "at": job.started_at})
     if job.stage == "audio_prepare":
         _process_audio_prepare(config, call_dir)
@@ -168,6 +207,8 @@ def process_job(config: AppConfig, job) -> None:
         _process_transcription(config, call_dir)
     elif job.stage == "diarization":
         _process_diarization(config, call_dir)
+    elif job.stage == "speaker_identity":
+        _process_speaker_identity(config, call_dir)
     elif job.stage == "transcript_clean":
         _process_transcript_clean(config, call_dir)
     elif job.stage == "analysis":
@@ -222,26 +263,54 @@ def drain_queue(config: AppConfig) -> int:
     return processed
 
 
+def run_manual_step(config: AppConfig) -> tuple[int, bool]:
+    imported = detect_new_calls(config)
+    processed = run_once(config, scan_first=False)
+    return len(imported), processed
+
+
 class WorkerThread:
     def __init__(self, config: AppConfig):
         self.config = config
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self._started = False
 
     def start(self) -> None:
+        if processing_mode(self.config) == "manual_step":
+            logger.info("Worker startup_mode=manual_step automatic background processing disabled")
+            return
+        recovered = reset_running_jobs_on_startup(self.config)
+        if recovered:
+            logger.warning("Worker startup recovered_running_jobs=%s", recovered)
         self._thread.start()
+        self._started = True
 
     def stop(self) -> None:
+        if not self._started:
+            return
         self._stop.set()
         self._thread.join(timeout=5)
 
     def _run(self) -> None:
+        scan_interval = max(1, int(self.config.section("ingest")["scan_interval_seconds"]))
+        next_scan_at = 0.0
+        processed_since_scan = 0
+
         while not self._stop.is_set():
-            imported = detect_new_calls(self.config)
-            if imported:
-                logger.info("Worker scan imported_count=%s", len(imported))
-            processed = drain_queue(self.config)
-            if processed:
-                logger.info("Worker drain processed_jobs=%s", processed)
+            now = time.monotonic()
+            if now >= next_scan_at:
+                imported = detect_new_calls(self.config)
+                if imported:
+                    logger.info("Worker scan imported_count=%s", len(imported))
+                if processed_since_scan:
+                    logger.info("Worker processed_jobs_since_last_scan=%s", processed_since_scan)
+                    processed_since_scan = 0
+                next_scan_at = now + scan_interval
+
+            if run_once(self.config, scan_first=False):
+                processed_since_scan += 1
                 continue
-            time.sleep(int(self.config.section("ingest")["scan_interval_seconds"]))
+
+            sleep_for = max(0.2, min(1.0, next_scan_at - time.monotonic()))
+            self._stop.wait(sleep_for)

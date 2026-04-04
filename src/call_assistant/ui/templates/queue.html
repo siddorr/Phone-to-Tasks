@@ -8,11 +8,26 @@
       table { width: 100%; border-collapse: collapse; background: #fff; }
       th, td { padding: 0.75rem; border-bottom: 1px solid #ddd4c7; vertical-align: top; }
       form { display: inline; }
+      .notice { padding: 0.8rem 1rem; background: #e9f3e4; border: 1px solid #b8d2aa; margin-bottom: 1rem; }
+      .mode { padding: 0.8rem 1rem; background: #fff; border: 1px solid #ddd4c7; margin-bottom: 1rem; display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+      .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; background: #efe4c8; }
     </style>
   </head>
   <body>
     <p><a href="/calls">Back to calls</a></p>
     <h1>Queue</h1>
+    {% if notice %}
+    <div class="notice">{{ notice }}</div>
+    {% endif %}
+    <div class="mode">
+      <strong>Processing mode:</strong>
+      <span class="badge">{{ processing_mode }}</span>
+      {% if processing_mode == 'manual_step' %}
+      <form method="post" action="/queue/process-next">
+        <button type="submit">Scan + Process One Job</button>
+      </form>
+      {% endif %}
+    </div>
     <table>
       <thead>
         <tr>

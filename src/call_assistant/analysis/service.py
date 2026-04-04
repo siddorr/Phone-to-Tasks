@@ -30,7 +30,11 @@ def _fallback_analysis(clean: CleanTranscript, segments: list[TranscriptSegment]
     decisions = [segment.text for segment in segments if re.search(r"\b(decided|agreed|confirm)\b", segment.text, re.I)]
     questions = [segment.text for segment in segments if "?" in segment.text]
     commitments = [segment.text for segment in segments if re.search(r"\b(i will|we will|promise)\b", segment.text, re.I)]
-    short_summary = lines[0] if lines else "No transcript content available."
+    short_summary = (
+        "Call transcript available; automatic summary confidence is low."
+        if lines
+        else "No transcript content available."
+    )
     detailed_summary = " ".join(lines[:8]) if lines else short_summary
     return AnalysisBundle(
         short_summary=short_summary,
@@ -42,7 +46,7 @@ def _fallback_analysis(clean: CleanTranscript, segments: list[TranscriptSegment]
         tasks=task_candidates,
         analysis_confidence=0.45 if task_candidates else 0.3,
         analysis_language="mixed",
-        low_confidence_reason="deterministic fallback analysis",
+        low_confidence_reason="deterministic fallback analysis on possible mixed-language transcript",
     )
 
 
@@ -53,9 +57,10 @@ def _openai_analysis(clean: CleanTranscript, segments: list[TranscriptSegment], 
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not configured")
     client = OpenAI(api_key=api_key)
-    prompt = """
+    summary_language = config.section("analysis").get("summary_language", "en")
+    prompt = f"""
 Analyze this call transcript and return JSON with:
-{
+{{
   "short_summary": "string",
   "detailed_summary": "string",
   "key_points": ["string"],
@@ -65,17 +70,22 @@ Analyze this call transcript and return JSON with:
   "analysis_confidence": 0.0,
   "analysis_language": "string",
   "tasks": [
-    {
+    {{
       "text": "string",
       "owner": "me|other|unknown",
       "type": "task|waiting|follow_up|reminder",
       "status": "new",
       "deadline": "optional string",
       "confidence": 0.0
-    }
+    }}
   ]
-}
+}}
 Return JSON only.
+The transcript may contain multiple languages, including Hebrew and Russian.
+Preserve factual meaning across mixed-language content.
+Write summaries and structured fields in {summary_language}.
+Keep quoted/source transcript text in the original spoken language when attaching tasks.
+Do not treat Hebrew content as noise or omit it because the call is mixed-language.
 """
     response = client.chat.completions.create(
         model=config.section("analysis")["model"],

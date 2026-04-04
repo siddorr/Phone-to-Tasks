@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import logging
 import uuid
+from pathlib import Path
 
 from call_assistant.common.config import AppConfig
 from call_assistant.common.db import connect
@@ -11,18 +12,77 @@ from call_assistant.common.models import QueueJob, utc_now
 logger = logging.getLogger(__name__)
 
 
-def _reclaim_stale_running_jobs(config: AppConfig) -> None:
-    stale_after_seconds = int(config.section("queue").get("stale_job_seconds", 300))
-    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)).isoformat()
+def reset_running_jobs_on_startup(config: AppConfig) -> int:
     db = connect(config.sqlite_path)
-    stale_jobs = db.execute(
+    rows = db.execute("SELECT job_id, call_id, stage FROM queue_jobs WHERE status = 'running'").fetchall()
+    if not rows:
+        return 0
+    for row in rows:
+        db.execute(
+            """
+            UPDATE queue_jobs
+            SET status = 'queued', finished_at = ?, error_message = ?
+            WHERE job_id = ?
+            """,
+            (utc_now(), "Recovered running job during worker startup", row["job_id"]),
+        )
+        logger.warning(
+            "Queue reset running job on startup job_id=%s call_id=%s stage=%s",
+            row["job_id"],
+            row["call_id"],
+            row["stage"],
+        )
+    db.commit()
+    return len(rows)
+
+
+def _stale_after_seconds_for_job(config: AppConfig, row) -> int:
+    base_stale_seconds = int(config.section("queue").get("stale_job_seconds", 300))
+    if row["stage"] != "transcription":
+        return base_stale_seconds
+
+    db = connect(config.sqlite_path)
+    call_row = db.execute(
+        "SELECT archive_path, duration_seconds FROM calls WHERE call_id = ?",
+        (row["call_id"],),
+    ).fetchone()
+
+    duration_seconds = 0.0
+    if call_row is not None and call_row["duration_seconds"] is not None:
+        duration_seconds = float(call_row["duration_seconds"])
+    elif call_row is not None:
+        metadata_path = Path(call_row["archive_path"]) / "metadata.json"
+        if metadata_path.exists():
+            import json
+
+            try:
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                duration_seconds = float(payload.get("duration_seconds") or 0.0)
+            except (ValueError, TypeError, json.JSONDecodeError):
+                duration_seconds = 0.0
+
+    multiplier = float(config.section("queue").get("transcription_stale_multiplier", 20))
+    buffer_seconds = int(config.section("queue").get("transcription_stale_buffer_seconds", 600))
+    minimum_seconds = int(config.section("queue").get("transcription_stale_min_seconds", 1800))
+    scaled_seconds = int(duration_seconds * multiplier) + buffer_seconds
+    return max(base_stale_seconds, minimum_seconds, scaled_seconds)
+
+
+def _reclaim_stale_running_jobs(config: AppConfig) -> None:
+    db = connect(config.sqlite_path)
+    running_jobs = db.execute(
         """
         SELECT * FROM queue_jobs
-        WHERE status = 'running' AND started_at IS NOT NULL AND started_at <= ?
+        WHERE status = 'running' AND started_at IS NOT NULL
         """,
-        (cutoff,),
     ).fetchall()
-    for row in stale_jobs:
+    now = datetime.now(timezone.utc)
+    for row in running_jobs:
+        stale_after_seconds = _stale_after_seconds_for_job(config, row)
+        cutoff = now - timedelta(seconds=stale_after_seconds)
+        started_at = datetime.fromisoformat(row["started_at"])
+        if started_at > cutoff:
+            continue
         next_status = "queued" if row["attempt_count"] < row["max_attempts"] else "failed"
         error_message = "Reclaimed stale running job after worker interruption"
         db.execute(
@@ -34,11 +94,12 @@ def _reclaim_stale_running_jobs(config: AppConfig) -> None:
             (next_status, utc_now(), error_message, row["job_id"]),
         )
         logger.warning(
-            "Queue reclaimed stale job_id=%s call_id=%s stage=%s next_status=%s",
+            "Queue reclaimed stale job_id=%s call_id=%s stage=%s next_status=%s stale_after_seconds=%s",
             row["job_id"],
             row["call_id"],
             row["stage"],
             next_status,
+            stale_after_seconds,
         )
     db.commit()
 

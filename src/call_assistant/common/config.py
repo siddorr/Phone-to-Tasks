@@ -27,6 +27,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "queue": {
         "worker_count": 1,
         "stale_job_seconds": 300,
+        "transcription_stale_multiplier": 3,
+        "transcription_stale_buffer_seconds": 600,
+        "transcription_stale_min_seconds": 1800,
         "retry_limits": {
             "import": 2,
             "audio_prepare": 2,
@@ -37,6 +40,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "indexing": 2,
         },
     },
+    "processing": {
+        "startup_mode": "automatic",
+    },
     "transcription": {
         "provider_default": "local",
         "provider_fallback": "cloud",
@@ -45,6 +51,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cloud_enabled": True,
         "cloud_model": "whisper-1",
         "language_hints": ["ru", "he", "en"],
+        "language_mode": "auto",
+        "force_language_for_single_language_calls": False,
+        "mixed_language_triggers": ["he", "ru"],
     },
     "diarization": {
         "provider": "pyannote",
@@ -52,10 +61,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fallback_single_speaker": True,
         "confidence_default": "medium",
     },
+    "speaker_identity": {
+        "enabled": True,
+        "provider": "pyannote",
+        "auto_assign_threshold": 0.75,
+        "suggest_threshold": 0.60,
+        "min_cluster_duration_seconds": 6,
+        "max_segments_per_cluster": 20,
+        "continue_on_error": True,
+    },
     "analysis": {
         "enabled": True,
         "provider": "openai",
         "model": "gpt-4o-mini",
+        "summary_language": "en",
         "timeout_sec": 90,
         "max_retries": 2,
     },

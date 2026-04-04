@@ -40,14 +40,17 @@ def index_call(call_dir: Path, config: AppConfig) -> None:
     db.execute(
         """
         INSERT INTO calls (
-            call_id, archive_path, source_filename, sha256, recorded_at, imported_at,
+            call_id, archive_path, source_filename, source_path, sha256, recorded_at, recorded_at_source, recorded_at_confidence, imported_at,
             duration_seconds, audio_format, language_summary, current_state, review_state,
             low_confidence, last_error, search_text
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(call_id) DO UPDATE SET
             archive_path=excluded.archive_path,
             source_filename=excluded.source_filename,
+            source_path=COALESCE(excluded.source_path, calls.source_path),
             recorded_at=COALESCE(excluded.recorded_at, calls.recorded_at),
+            recorded_at_source=COALESCE(excluded.recorded_at_source, calls.recorded_at_source),
+            recorded_at_confidence=COALESCE(excluded.recorded_at_confidence, calls.recorded_at_confidence),
             imported_at=COALESCE(calls.imported_at, excluded.imported_at),
             duration_seconds=excluded.duration_seconds,
             audio_format=excluded.audio_format,
@@ -62,8 +65,11 @@ def index_call(call_dir: Path, config: AppConfig) -> None:
             metadata["call_id"],
             str(call_dir),
             metadata["source_filename"],
+            metadata.get("source_path"),
             metadata["sha256"],
             metadata.get("recorded_at"),
+            metadata.get("recorded_at_source"),
+            metadata.get("recorded_at_confidence"),
             metadata["imported_at"],
             metadata.get("duration_seconds"),
             metadata.get("audio_format"),

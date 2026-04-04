@@ -48,6 +48,9 @@ class TranscriptSegment:
     confidence: float | None
     speaker_cluster_id: str = "speaker_1"
     diarization_confidence: str | None = None
+    speaker_identity_id: str | None = None
+    speaker_display_name: str | None = None
+    identity_confidence: float | None = None
 
 
 @dataclass
@@ -98,6 +101,8 @@ class CallMetadata:
     recorded_at: str | None
     file_size_bytes: int
     sha256: str
+    recorded_at_source: str | None = None
+    recorded_at_confidence: str | None = None
     audio_format: str | None = None
     duration_seconds: float | None = None
     language_hints: list[str] = field(default_factory=list)

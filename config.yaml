@@ -18,6 +18,10 @@ ingest:
 
 queue:
   worker_count: 1
+  stale_job_seconds: 300
+  transcription_stale_multiplier: 3
+  transcription_stale_buffer_seconds: 600
+  transcription_stale_min_seconds: 1800
   retry_limits:
     import: 2
     audio_prepare: 2
@@ -27,6 +31,9 @@ queue:
     analysis: 2
     indexing: 2
 
+processing:
+  startup_mode: "manual_step"
+
 transcription:
   provider_default: "local"
   provider_fallback: "cloud"
@@ -35,6 +42,9 @@ transcription:
   cloud_enabled: true
   cloud_model: "whisper-1"
   language_hints: ["ru", "he", "en"]
+  language_mode: "auto"
+  force_language_for_single_language_calls: false
+  mixed_language_triggers: ["he", "ru"]
 
 diarization:
   provider: "pyannote"
@@ -46,6 +56,7 @@ analysis:
   enabled: true
   provider: "openai"
   model: "gpt-4o-mini"
+  summary_language: "en"
   timeout_sec: 90
   max_retries: 2
 

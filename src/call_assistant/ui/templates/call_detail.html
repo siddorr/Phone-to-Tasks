@@ -10,10 +10,18 @@
       textarea, input, select { width: 100%; padding: 0.5rem; margin: 0.2rem 0 0.6rem; }
       .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
       .task { border-top: 1px solid #ddd4c7; padding-top: 0.75rem; margin-top: 0.75rem; }
+      .audio-panel { display: grid; gap: 0.75rem; }
+      .segment-list { max-height: 420px; overflow: auto; border: 1px solid #ddd4c7; padding: 0.5rem; background: #fffdf9; }
+      .segment-line { padding: 0.65rem; border-left: 3px solid transparent; cursor: pointer; }
+      .segment-line + .segment-line { border-top: 1px solid #eee2d2; }
+      .segment-line.is-active { background: #f5ebd5; border-left-color: #876223; }
+      .segment-meta { color: #5f5d55; font-size: 0.92rem; margin-bottom: 0.25rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+      .inline-form { display: grid; grid-template-columns: 1fr auto; gap: 0.5rem; align-items: end; }
+      .triple-form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 0.5rem; align-items: end; }
     </style>
   </head>
   <body>
-    <p><a href="/calls">Back to calls</a> | <a href="/queue">Queue</a></p>
+    <p><a href="/calls">Back to calls</a> | <a href="/queue">Queue</a> | <a href="/speakers">Speakers</a></p>
     <h1>{{ call.call_id }}</h1>
     <section>
       <h2>Metadata</h2>
@@ -29,9 +37,28 @@
             <option value="{{ option.value }}" {% if option.value == selected_retranscribe_choice %}selected{% endif %}>{{ option.label }}</option>
             {% endfor %}
           </select>
+          <label>Language Mode</label>
+          <select name="language_override">
+            {% for option in retranscribe_language_choices %}
+            <option value="{{ option.value }}" {% if option.value == selected_retranscribe_language %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
           <button type="submit">Retranscribe</button>
         </form>
       </div>
+    </section>
+    <section>
+      <h2>Audio</h2>
+      {% if audio_url %}
+      <div class="audio-panel">
+        <audio id="call-audio" controls preload="metadata">
+          <source src="{{ audio_url }}">
+        </audio>
+        <p>Play audio and follow the synced transcript below.</p>
+      </div>
+      {% else %}
+      <p>No playable audio file found.</p>
+      {% endif %}
     </section>
     <div class="grid">
       <section>
@@ -39,13 +66,35 @@
         <pre>{{ summary | tojson(indent=2) }}</pre>
       </section>
       <section>
-        <h2>Transcript</h2>
+        <h2>Clean Transcript</h2>
         <pre>{{ transcript_clean }}</pre>
       </section>
     </div>
     <section>
-      <h2>Segments</h2>
-      <pre>{{ segments | tojson(indent=2) }}</pre>
+      <h2>Synced Transcript Segments</h2>
+      {% if segment_view %}
+      <div class="segment-list" id="segment-list">
+        {% for segment in segment_view %}
+        <div
+          class="segment-line"
+          id="{{ segment.segment_dom_id }}"
+          data-start-sec="{{ segment.start_sec }}"
+          data-end-sec="{{ segment.end_sec }}"
+        >
+          <div class="segment-meta">
+            <span>[{{ segment.display_timestamp }}]</span>
+            <span>{{ segment.display_speaker }}</span>
+            {% if segment.identity_confidence is not none %}
+            <span>match={{ "%.2f"|format(segment.identity_confidence) }}</span>
+            {% endif %}
+          </div>
+          <div>{{ segment.text }}</div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p>No transcript segments found yet.</p>
+      {% endif %}
     </section>
     <section>
       <h2>Speaker Mapping</h2>
@@ -66,6 +115,42 @@
       </form>
       {% else %}
       <p>No diarized speaker clusters found yet.</p>
+      {% endif %}
+    </section>
+    <section>
+      <h2>Speaker Identities</h2>
+      {% if speaker_clusters %}
+      {% for cluster_id in speaker_clusters %}
+      {% set cluster_segment = (segment_view | selectattr('speaker_cluster_id', 'equalto', cluster_id) | list | first) %}
+      <div class="task">
+        <strong>{{ cluster_id }}</strong>
+        <div>Current identity: {{ cluster_segment.speaker_display_name if cluster_segment and cluster_segment.speaker_identity_id else 'Unassigned' }}</div>
+        {% if cluster_segment and cluster_segment.identity_confidence is not none %}
+        <div>Last match score: {{ "%.2f"|format(cluster_segment.identity_confidence) }}</div>
+        {% endif %}
+        <form method="post" action="/calls/{{ call.call_id }}/speakers/assign" class="inline-form">
+          <input type="hidden" name="speaker_cluster_id" value="{{ cluster_id }}">
+          <select name="speaker_identity_id">
+            {% for profile in speaker_profiles %}
+            <option value="{{ profile.speaker_identity_id }}" {% if cluster_segment and cluster_segment.speaker_identity_id == profile.speaker_identity_id %}selected{% endif %}>{{ profile.display_name }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit">Assign existing</button>
+        </form>
+        <form method="post" action="/calls/{{ call.call_id }}/speakers/create-and-assign" class="triple-form">
+          <input type="hidden" name="speaker_cluster_id" value="{{ cluster_id }}">
+          <input type="text" name="display_name" placeholder="New speaker name">
+          <span></span>
+          <button type="submit">Create and assign</button>
+        </form>
+        <form method="post" action="/calls/{{ call.call_id }}/speakers/clear">
+          <input type="hidden" name="speaker_cluster_id" value="{{ cluster_id }}">
+          <button type="submit">Clear identity</button>
+        </form>
+      </div>
+      {% endfor %}
+      {% else %}
+      <p>No speaker clusters available for identity assignment yet.</p>
       {% endif %}
     </section>
     <section>
@@ -103,5 +188,52 @@
       <h2>Processing Log</h2>
       <pre>{{ processing_log | tojson(indent=2) }}</pre>
     </section>
+    <script>
+      (() => {
+        const audio = document.getElementById("call-audio");
+        const segmentNodes = Array.from(document.querySelectorAll(".segment-line"));
+        if (!audio || segmentNodes.length === 0) return;
+
+        const segments = segmentNodes
+          .map((node) => ({
+            node,
+            start: Number(node.dataset.startSec),
+            end: Number(node.dataset.endSec),
+          }))
+          .filter((item) => Number.isFinite(item.start) && Number.isFinite(item.end));
+
+        let activeNode = null;
+
+        function setActive(node) {
+          if (activeNode === node) return;
+          if (activeNode) activeNode.classList.remove("is-active");
+          activeNode = node;
+          if (!activeNode) return;
+          activeNode.classList.add("is-active");
+          activeNode.scrollIntoView({ block: "nearest" });
+        }
+
+        function activeForTime(currentTime) {
+          let current = segments.find((item) => item.start <= currentTime && currentTime < item.end);
+          if (!current) {
+            const previous = segments.filter((item) => item.start <= currentTime);
+            current = previous.length ? previous[previous.length - 1] : null;
+          }
+          setActive(current ? current.node : null);
+        }
+
+        audio.addEventListener("timeupdate", () => activeForTime(audio.currentTime));
+
+        segmentNodes.forEach((node) => {
+          node.addEventListener("click", () => {
+            const start = Number(node.dataset.startSec);
+            if (Number.isFinite(start)) {
+              audio.currentTime = start;
+              activeForTime(start);
+            }
+          });
+        });
+      })();
+    </script>
   </body>
 </html>

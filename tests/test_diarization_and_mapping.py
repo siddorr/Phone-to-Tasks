@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
 
 from call_assistant.common.config import AppConfig
 from call_assistant.common.models import RawSegment, RawTranscript, TranscriptSegment
+from call_assistant.analysis.service import _fallback_analysis
 from call_assistant.diarization.service import apply_speaker_mapping, diarize
 from call_assistant.transcript_cleaner.service import clean_transcript
 
@@ -96,6 +97,25 @@ diarization:
             ]
         )
         self.assertIn("SPEAKER 1", clean.text)
+
+    def test_fallback_analysis_short_summary_is_not_first_line(self) -> None:
+        segments = [
+            TranscriptSegment(
+                segment_id="seg_0001",
+                start_sec=0.0,
+                end_sec=1.0,
+                speaker_cluster_id="speaker_1",
+                speaker_label="speaker_1",
+                speaker_channel_label=None,
+                text="Алло",
+                confidence=None,
+                diarization_confidence="medium",
+            )
+        ]
+        clean = clean_transcript(segments)
+        analysis = _fallback_analysis(clean, segments)
+        self.assertNotEqual(analysis.short_summary, "Алло")
+        self.assertIn("automatic summary confidence is low", analysis.short_summary.lower())
 
 
 if __name__ == "__main__":

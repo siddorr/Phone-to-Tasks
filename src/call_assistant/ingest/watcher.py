@@ -12,6 +12,7 @@ from call_assistant.common.config import AppConfig
 from call_assistant.common.db import connect
 from call_assistant.common.io import append_log, write_json
 from call_assistant.common.models import CallMetadata, call_dir_from_metadata
+from call_assistant.ingest.recorded_time import resolve_recorded_at
 from call_assistant.orchestrator.queue import enqueue
 
 logger = logging.getLogger(__name__)
@@ -49,23 +50,32 @@ def already_imported(config: AppConfig, sha256: str) -> bool:
     return row is not None
 
 
+def already_imported_source_path(config: AppConfig, source_path: Path) -> bool:
+    db = connect(config.sqlite_path)
+    row = db.execute("SELECT call_id FROM calls WHERE source_path = ?", (str(source_path.resolve()),)).fetchone()
+    return row is not None
+
+
 def register_imported_call(config: AppConfig, metadata: CallMetadata, call_dir: Path) -> bool:
     db = connect(config.sqlite_path)
     try:
         db.execute(
             """
             INSERT INTO calls (
-                call_id, archive_path, source_filename, sha256, recorded_at, imported_at,
+                call_id, archive_path, source_filename, source_path, sha256, recorded_at, recorded_at_source, recorded_at_confidence, imported_at,
                 duration_seconds, audio_format, language_summary, current_state, review_state,
                 low_confidence, last_error, search_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 metadata.call_id,
                 str(call_dir),
                 metadata.source_filename,
+                metadata.source_path,
                 metadata.sha256,
                 metadata.recorded_at,
+                metadata.recorded_at_source,
+                metadata.recorded_at_confidence,
                 metadata.imported_at,
                 metadata.duration_seconds,
                 metadata.audio_format,
@@ -85,6 +95,9 @@ def register_imported_call(config: AppConfig, metadata: CallMetadata, call_dir: 
 
 
 def import_file(path: Path, config: AppConfig) -> str | None:
+    if already_imported_source_path(config, path):
+        logger.info("Import skipped file=%s reason=known_source_path", path)
+        return None
     if not is_file_stable(path, config):
         logger.info("Import skipped file=%s reason=unstable", path)
         return None
@@ -94,6 +107,7 @@ def import_file(path: Path, config: AppConfig) -> str | None:
         return None
     imported_at = datetime.now(timezone.utc).isoformat()
     call_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{sha256[:6]}"
+    recorded_at, recorded_at_source, recorded_at_confidence = resolve_recorded_at(path)
     metadata = CallMetadata(
         schema_version="1.0",
         app_version=__version__,
@@ -101,7 +115,9 @@ def import_file(path: Path, config: AppConfig) -> str | None:
         source_filename=path.name,
         source_path=str(path.resolve()),
         imported_at=imported_at,
-        recorded_at=datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+        recorded_at=recorded_at,
+        recorded_at_source=recorded_at_source,
+        recorded_at_confidence=recorded_at_confidence,
         file_size_bytes=path.stat().st_size,
         sha256=sha256,
         language_hints=config.section("transcription").get("language_hints", []),
