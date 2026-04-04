@@ -40,11 +40,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "transcription": {
         "provider_default": "local",
         "provider_fallback": "cloud",
-        "local_model": "small",
+        "local_model": "large-v3-turbo",
         "local_device": "auto",
         "cloud_enabled": True,
         "cloud_model": "whisper-1",
         "language_hints": ["ru", "he", "en"],
+    },
+    "diarization": {
+        "provider": "pyannote",
+        "enabled": True,
+        "fallback_single_speaker": True,
+        "confidence_default": "medium",
     },
     "analysis": {
         "enabled": True,

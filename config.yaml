@@ -36,6 +36,12 @@ transcription:
   cloud_model: "whisper-1"
   language_hints: ["ru", "he", "en"]
 
+diarization:
+  provider: "pyannote"
+  enabled: true
+  fallback_single_speaker: true
+  confidence_default: "medium"
+
 analysis:
   enabled: true
   provider: "openai"

@@ -76,14 +76,25 @@ def _process_transcription(config: AppConfig, call_dir: Path) -> None:
 def _process_diarization(config: AppConfig, call_dir: Path) -> None:
     logger.info("Stage diarization start call_dir=%s", call_dir)
     raw = read_json(call_dir / "transcript_raw.json", default={})
-    normalized = transcribe_data_to_segments(raw)
+    metadata = read_json(call_dir / "metadata.json", default={})
+    normalized = transcribe_data_to_segments(
+        raw,
+        config,
+        call_dir / "audio_normalized.wav",
+        metadata.get("speaker_mapping"),
+    )
     write_json(call_dir / "transcript_segments.json", normalized)
     metadata = _update_metadata(call_dir, current_state="diarized")
     _sync_call_row(config, call_dir)
     logger.info("Stage diarization success call_dir=%s segments=%s", call_dir, len(normalized))
 
 
-def transcribe_data_to_segments(raw_payload: dict) -> list[dict]:
+def transcribe_data_to_segments(
+    raw_payload: dict,
+    config: AppConfig,
+    audio_path: Path,
+    speaker_mapping: dict[str, str] | None = None,
+) -> list[dict]:
     from call_assistant.common.models import RawSegment, RawTranscript
 
     raw = RawTranscript(
@@ -103,7 +114,7 @@ def transcribe_data_to_segments(raw_payload: dict) -> list[dict]:
             for item in raw_payload.get("segments", [])
         ],
     )
-    return diarize(raw)
+    return diarize(raw, config, audio_path=audio_path, speaker_mapping=speaker_mapping)
 
 
 def _process_transcript_clean(config: AppConfig, call_dir: Path) -> None:

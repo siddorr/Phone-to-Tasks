@@ -14,6 +14,28 @@ The project now uses a modular archive-based pipeline instead of a single SQLite
 - SQLite in `data/index/call_assistant.db` is the searchable index
 - A local FastAPI UI exposes calls, task review, and queue state
 
+## Implemented Features
+
+Current app capabilities:
+
+- Local web UI at `/calls` and `/queue`
+- Incoming-folder ingest from `data/incoming`
+- Browser upload of supported audio files
+- Duplicate detection by SHA-256
+- Per-call archive folders with canonical artifacts on disk
+- SQLite indexing for calls, tasks, artifacts, and queue state
+- Audio normalization to mono 16 kHz WAV
+- Local transcription with selectable Whisper models
+- Optional OpenAI transcription fallback with `whisper-1`
+- Transcript cleaning and normalized segment output
+- Summary and task extraction
+- Task review/edit flow in the UI
+- Queue inspection and retry from the UI
+- Reindex action from the UI
+- Retranscribe action from the UI with model selection
+- Background worker that continues processing after import
+- One-shot CLI processing for batch runs and debugging
+
 ## Main Entry Points
 
 - `python3 main.py`

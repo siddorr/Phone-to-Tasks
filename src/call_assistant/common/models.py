@@ -46,6 +46,8 @@ class TranscriptSegment:
     speaker_channel_label: str | None
     text: str
     confidence: float | None
+    speaker_cluster_id: str = "speaker_1"
+    diarization_confidence: str | None = None
 
 
 @dataclass

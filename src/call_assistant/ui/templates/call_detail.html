@@ -48,6 +48,27 @@
       <pre>{{ segments | tojson(indent=2) }}</pre>
     </section>
     <section>
+      <h2>Speaker Mapping</h2>
+      {% if speaker_clusters %}
+      <form method="post" action="/calls/{{ call.call_id }}/speaker-mapping">
+        {% for cluster_id in speaker_clusters %}
+        <div class="task">
+          <input type="hidden" name="speaker_cluster_id" value="{{ cluster_id }}">
+          <label>{{ cluster_id }}</label>
+          <select name="speaker_role">
+            {% for option in ['me', 'other', 'unknown'] %}
+            <option value="{{ option }}" {% if speaker_mapping.get(cluster_id, cluster_id) == option %}selected{% endif %}>{{ option }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        {% endfor %}
+        <button type="submit">Save speaker mapping</button>
+      </form>
+      {% else %}
+      <p>No diarized speaker clusters found yet.</p>
+      {% endif %}
+    </section>
+    <section>
       <h2>Review Tasks</h2>
       <form method="post" action="/calls/{{ call.call_id }}/tasks/review">
         {% for task in tasks %}

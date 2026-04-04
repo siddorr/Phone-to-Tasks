@@ -16,7 +16,7 @@ def clean_transcript(segments: list[TranscriptSegment]) -> CleanTranscript:
     for segment in segments:
         cleaned = _clean_text(segment.text)
         segment.text = cleaned
-        label = segment.speaker_label.upper()
+        label = segment.speaker_label.replace("speaker_", "speaker ").upper()
         start = f"{segment.start_sec:07.2f}"
         lines.append(f"[{start}] {label}: {cleaned}")
     return CleanTranscript(text="\n".join(lines), segments=segments)

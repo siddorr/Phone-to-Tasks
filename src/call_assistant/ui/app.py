@@ -13,9 +13,11 @@ from call_assistant.common.config import AppConfig
 from call_assistant.common.db import connect
 from call_assistant.common.io import append_log, read_json, write_json
 from call_assistant.common.models import utc_now
+from call_assistant.diarization.service import apply_speaker_mapping
 from call_assistant.ingest.watcher import import_file
 from call_assistant.indexing.service import index_call
 from call_assistant.orchestrator.queue import enqueue, list_jobs
+from call_assistant.transcript_cleaner.service import clean_transcript
 
 logger = logging.getLogger(__name__)
 RETRANSCRIBE_STAGES = ("transcription", "diarization", "transcript_clean", "analysis", "indexing")
@@ -47,6 +49,9 @@ def _reset_call_for_retranscription(config: AppConfig, call_id: str, call_dir: P
     metadata["current_state"] = "audio_prepared"
     metadata["review_state"] = "pending"
     metadata["transcription_preference"] = {"provider": provider, "model": model}
+    metadata["speaker_mapping"] = {}
+    metadata["speaker_mapping_reviewed_at"] = None
+    metadata["speaker_mapping_source"] = "none"
     metadata["errors"] = []
     write_json(call_dir / "metadata.json", metadata)
     write_json(call_dir / "tasks_reviewed.json", [])
@@ -156,6 +161,14 @@ def create_app(config: AppConfig) -> FastAPI:
         call, call_dir = _load_call(call_id)
         retranscribe_choices = _transcription_choices(config)
         metadata = read_json(call_dir / "metadata.json", default={})
+        segments = read_json(call_dir / "transcript_segments.json", default=[])
+        speaker_clusters = sorted(
+            {
+                item.get("speaker_cluster_id") or item.get("speaker_label")
+                for item in segments
+                if (item.get("speaker_cluster_id") or item.get("speaker_label"))
+            }
+        )
         selected_choice = f"{metadata.get('transcription_preference', {}).get('provider', 'local')}:{metadata.get('transcription_preference', {}).get('model', config.section('transcription')['local_model'])}"
         context = {
             "request": request,
@@ -164,13 +177,15 @@ def create_app(config: AppConfig) -> FastAPI:
             "summary": read_json(call_dir / "summary.json", default={}),
             "tasks": read_json(call_dir / "tasks.json", default=[]),
             "reviewed_tasks": read_json(call_dir / "tasks_reviewed.json", default=[]),
-            "segments": read_json(call_dir / "transcript_segments.json", default=[]),
+            "segments": segments,
             "transcript_clean": (call_dir / "transcript_clean.txt").read_text(encoding="utf-8")
             if (call_dir / "transcript_clean.txt").exists()
             else "",
             "processing_log": read_json(call_dir / "processing_log.json", default=[]),
             "retranscribe_choices": retranscribe_choices,
             "selected_retranscribe_choice": selected_choice,
+            "speaker_clusters": speaker_clusters,
+            "speaker_mapping": metadata.get("speaker_mapping", {}),
         }
         return templates.TemplateResponse(request, "call_detail.html", context)
 
@@ -240,6 +255,37 @@ def create_app(config: AppConfig) -> FastAPI:
         if model_choice not in choices:
             raise HTTPException(status_code=400, detail="Unsupported transcription model selection")
         _reset_call_for_retranscription(config, call_id, call_dir, model_choice)
+        return RedirectResponse(url=f"/calls/{call_id}", status_code=303)
+
+    @app.post("/calls/{call_id}/speaker-mapping")
+    async def save_speaker_mapping(
+        call_id: str,
+        request: Request,
+        speaker_cluster_id: list[str] = Form(default=[]),
+        speaker_role: list[str] = Form(default=[]),
+    ):
+        _, call_dir = _load_call(call_id)
+        mapping = {
+            cluster_id: role
+            for cluster_id, role in zip(speaker_cluster_id, speaker_role)
+            if role in {"me", "other", "unknown"}
+        }
+        metadata = read_json(call_dir / "metadata.json", default={})
+        metadata["speaker_mapping"] = mapping
+        metadata["speaker_mapping_reviewed_at"] = utc_now()
+        metadata["speaker_mapping_source"] = "ui"
+        write_json(call_dir / "metadata.json", metadata)
+
+        raw_segments = read_json(call_dir / "transcript_segments.json", default=[])
+        mapped_segments = apply_speaker_mapping(raw_segments, mapping)
+        write_json(call_dir / "transcript_segments.json", mapped_segments)
+
+        from call_assistant.common.models import TranscriptSegment
+
+        clean = clean_transcript([TranscriptSegment(**item) for item in mapped_segments])
+        (call_dir / "transcript_clean.txt").write_text(clean.text, encoding="utf-8")
+        append_log(call_dir / "processing_log.json", {"event": "speaker_mapping_saved", "at": utc_now(), "mapping": mapping})
+        index_call(call_dir, config)
         return RedirectResponse(url=f"/calls/{call_id}", status_code=303)
 
     return app
