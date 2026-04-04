@@ -157,6 +157,29 @@ def claim_next_job(config: AppConfig) -> QueueJob | None:
     return QueueJob(**dict(row))
 
 
+def claim_next_job_for_call(config: AppConfig, call_id: str) -> QueueJob | None:
+    _reclaim_stale_running_jobs(config)
+    db = connect(config.sqlite_path)
+    row = db.execute(
+        """
+        SELECT * FROM queue_jobs
+        WHERE status = 'queued' AND call_id = ?
+        ORDER BY priority DESC, available_at ASC
+        LIMIT 1
+        """,
+        (call_id,),
+    ).fetchone()
+    if not row:
+        return None
+    db.execute(
+        "UPDATE queue_jobs SET status = 'running', attempt_count = attempt_count + 1, started_at = ? WHERE job_id = ?",
+        (utc_now(), row["job_id"]),
+    )
+    db.commit()
+    row = db.execute("SELECT * FROM queue_jobs WHERE job_id = ?", (row["job_id"],)).fetchone()
+    return QueueJob(**dict(row))
+
+
 def complete_job(config: AppConfig, job_id: str) -> None:
     db = connect(config.sqlite_path)
     db.execute(

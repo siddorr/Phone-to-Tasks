@@ -20,7 +20,7 @@ from call_assistant.ingest.watcher import file_sha256
 from call_assistant.ingest.watcher import import_file
 from call_assistant.ingest.watcher import already_imported_source_path
 from call_assistant.indexing.service import index_call
-from call_assistant.orchestrator.queue import _stale_after_seconds_for_job, claim_next_job, complete_job, enqueue, reset_running_jobs_on_startup
+from call_assistant.orchestrator.queue import _stale_after_seconds_for_job, claim_next_job, claim_next_job_for_call, complete_job, enqueue, reset_running_jobs_on_startup
 from call_assistant.orchestrator.worker import WorkerThread, processing_mode
 from call_assistant.reprocess import reset_all_calls_for_retranscription
 from call_assistant.reprocess import reset_call_for_retranscription
@@ -230,9 +230,9 @@ processing:
         thread_start.assert_called_once()
 
     def test_queue_manual_process_notice_runs_manual_step(self) -> None:
-        with patch("call_assistant.ui.app.run_manual_step", return_value=(2, True)) as run_step:
+        with patch("call_assistant.ui.app.run_manual_step", return_value=(2, "call_123", 4)) as run_step:
             notice = _manual_processing_notice(self.config)
-        self.assertEqual(notice, "Imported 2 new calls; processed 1 job.")
+        self.assertEqual(notice, "Imported 2 new calls; completed 4 stage(s) for call call_123.")
         run_step.assert_called_once_with(self.config)
 
     def test_queue_manual_process_notice_rejects_automatic_mode(self) -> None:
@@ -241,6 +241,15 @@ processing:
             notice = _manual_processing_notice(self.config)
         self.assertEqual(notice, "Manual processing is disabled in automatic mode.")
         run_step.assert_not_called()
+
+    def test_claim_next_job_for_call_claims_only_target_call(self) -> None:
+        enqueue(self.config, "call_a", "audio_prepare")
+        enqueue(self.config, "call_b", "audio_prepare")
+
+        job = claim_next_job_for_call(self.config, "call_b")
+
+        self.assertIsNotNone(job)
+        self.assertEqual(job.call_id, "call_b")
 
     def test_index_call_updates_existing_imported_row_state(self) -> None:
         sample = self.config.incoming_folder / "sample.wav"

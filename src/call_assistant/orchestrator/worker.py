@@ -13,7 +13,7 @@ from call_assistant.common.models import AnalysisBundle, artifact_paths
 from call_assistant.diarization.service import diarize
 from call_assistant.indexing.service import index_call
 from call_assistant.ingest.watcher import detect_new_calls
-from call_assistant.orchestrator.queue import claim_next_job, complete_job, enqueue, fail_job, reset_running_jobs_on_startup
+from call_assistant.orchestrator.queue import claim_next_job, claim_next_job_for_call, complete_job, enqueue, fail_job, reset_running_jobs_on_startup
 from call_assistant.speaker_identity.service import run_speaker_identity_stage
 from call_assistant.transcript_cleaner.service import clean_transcript
 from call_assistant.transcription.service import _looks_mixed_language_problem, _transcription_preferences, transcribe
@@ -223,12 +223,7 @@ def process_job(config: AppConfig, job) -> None:
         enqueue(config, job.call_id, next_stage)
 
 
-def run_once(config: AppConfig, scan_first: bool = False) -> bool:
-    if scan_first:
-        detect_new_calls(config)
-    job = claim_next_job(config)
-    if not job:
-        return False
+def _run_claimed_job(config: AppConfig, job) -> bool:
     logger.info("Worker claimed job_id=%s call_id=%s stage=%s attempt=%s", job.job_id, job.call_id, job.stage, job.attempt_count)
     try:
         process_job(config, job)
@@ -247,6 +242,15 @@ def run_once(config: AppConfig, scan_first: bool = False) -> bool:
         return True
 
 
+def run_once(config: AppConfig, scan_first: bool = False) -> bool:
+    if scan_first:
+        detect_new_calls(config)
+    job = claim_next_job(config)
+    if not job:
+        return False
+    return _run_claimed_job(config, job)
+
+
 def process_pending(config: AppConfig, scan_first: bool = True) -> int:
     processed = 0
     if scan_first:
@@ -263,10 +267,25 @@ def drain_queue(config: AppConfig) -> int:
     return processed
 
 
-def run_manual_step(config: AppConfig) -> tuple[int, bool]:
+def run_manual_step(config: AppConfig) -> tuple[int, str | None, int]:
     imported = detect_new_calls(config)
-    processed = run_once(config, scan_first=False)
-    return len(imported), processed
+    job = claim_next_job(config)
+    if not job:
+        return len(imported), None, 0
+
+    target_call_id = job.call_id
+    processed_stages = 0
+    _run_claimed_job(config, job)
+    processed_stages += 1
+
+    while True:
+        next_job = claim_next_job_for_call(config, target_call_id)
+        if not next_job:
+            break
+        _run_claimed_job(config, next_job)
+        processed_stages += 1
+
+    return len(imported), target_call_id, processed_stages
 
 
 class WorkerThread:

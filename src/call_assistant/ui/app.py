@@ -262,9 +262,10 @@ def _calls_sort_link(
 def _manual_processing_notice(config: AppConfig) -> str:
     if processing_mode(config) != "manual_step":
         return "Manual processing is disabled in automatic mode."
-    imported_count, processed = run_manual_step(config)
-    job_notice = "processed 1 job" if processed else "no queued job was available"
-    return f"Imported {imported_count} new calls; {job_notice}."
+    imported_count, call_id, stage_count = run_manual_step(config)
+    if not call_id:
+        return f"Imported {imported_count} new calls; no queued job was available."
+    return f"Imported {imported_count} new calls; completed {stage_count} stage(s) for call {call_id}."
 
 
 def _manual_processing_context(config: AppConfig, notice: str = "") -> dict[str, str]:
