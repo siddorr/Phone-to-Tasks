@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>{{ call.call_id }}</title>
+    <style>
+      body { font-family: Georgia, serif; margin: 2rem auto; max-width: 1200px; background: #fcf8f1; color: #1e1f1a; }
+      section { background: #fff; margin-bottom: 1rem; padding: 1rem; border: 1px solid #ddd4c7; }
+      pre { white-space: pre-wrap; }
+      textarea, input, select { width: 100%; padding: 0.5rem; margin: 0.2rem 0 0.6rem; }
+      .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+      .task { border-top: 1px solid #ddd4c7; padding-top: 0.75rem; margin-top: 0.75rem; }
+    </style>
+  </head>
+  <body>
+    <p><a href="/calls">Back to calls</a> | <a href="/queue">Queue</a></p>
+    <h1>{{ call.call_id }}</h1>
+    <section>
+      <h2>Metadata</h2>
+      <pre>{{ metadata | tojson(indent=2) }}</pre>
+      <div style="display: flex; gap: 0.75rem; align-items: end; flex-wrap: wrap;">
+        <form method="post" action="/calls/{{ call.call_id }}/reindex">
+          <button type="submit">Reindex</button>
+        </form>
+        <form method="post" action="/calls/{{ call.call_id }}/retranscribe" style="min-width: 320px;">
+          <label>Retranscribe Model</label>
+          <select name="model_choice">
+            {% for option in retranscribe_choices %}
+            <option value="{{ option.value }}" {% if option.value == selected_retranscribe_choice %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit">Retranscribe</button>
+        </form>
+      </div>
+    </section>
+    <div class="grid">
+      <section>
+        <h2>Summary</h2>
+        <pre>{{ summary | tojson(indent=2) }}</pre>
+      </section>
+      <section>
+        <h2>Transcript</h2>
+        <pre>{{ transcript_clean }}</pre>
+      </section>
+    </div>
+    <section>
+      <h2>Segments</h2>
+      <pre>{{ segments | tojson(indent=2) }}</pre>
+    </section>
+    <section>
+      <h2>Review Tasks</h2>
+      <form method="post" action="/calls/{{ call.call_id }}/tasks/review">
+        {% for task in tasks %}
+        <div class="task">
+          <input type="hidden" name="task_id" value="{{ task.task_id }}">
+          <label>Text</label>
+          <textarea name="text">{{ task.text }}</textarea>
+          <label>Owner</label>
+          <input type="text" name="owner" value="{{ task.owner or '' }}">
+          <label>Type</label>
+          <select name="task_type">
+            {% for option in ['task', 'waiting', 'follow_up', 'reminder'] %}
+            <option value="{{ option }}" {% if task.type == option %}selected{% endif %}>{{ option }}</option>
+            {% endfor %}
+          </select>
+          <label>Status</label>
+          <select name="status">
+            {% for option in ['new', 'confirmed', 'dismissed', 'edited'] %}
+            <option value="{{ option }}" {% if task.status == option %}selected{% endif %}>{{ option }}</option>
+            {% endfor %}
+          </select>
+          <label>Deadline</label>
+          <input type="text" name="deadline" value="{{ task.deadline or '' }}">
+        </div>
+        {% endfor %}
+        <button type="submit">Save reviewed tasks</button>
+      </form>
+      <h3>Reviewed Tasks</h3>
+      <pre>{{ reviewed_tasks | tojson(indent=2) }}</pre>
+    </section>
+    <section>
+      <h2>Processing Log</h2>
+      <pre>{{ processing_log | tojson(indent=2) }}</pre>
+    </section>
+  </body>
+</html>

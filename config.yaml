@@ -1,0 +1,51 @@
+app:
+  name: "call-assistant"
+  environment: "local"
+
+paths:
+  incoming_folder: "./data/incoming"
+  archive_root: "/home/garik/CallAssistantData/calls"
+  sqlite_path: "./data/index/call_assistant.db"
+  logs_dir: "./data/logs"
+  temp_dir: "./data/temp"
+
+ingest:
+  supported_extensions: [".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wma"]
+  stability_check_seconds: 2
+  stability_poll_interval_seconds: 1
+  file_hash_algorithm: "sha256"
+  scan_interval_seconds: 5
+
+queue:
+  worker_count: 1
+  retry_limits:
+    import: 2
+    audio_prepare: 2
+    transcription: 2
+    diarization: 2
+    transcript_clean: 2
+    analysis: 2
+    indexing: 2
+
+transcription:
+  provider_default: "local"
+  provider_fallback: "cloud"
+  local_model: "large-v3-turbo"
+  local_device: "auto"
+  cloud_enabled: true
+  cloud_model: "whisper-1"
+  language_hints: ["ru", "he", "en"]
+
+analysis:
+  enabled: true
+  provider: "openai"
+  model: "gpt-4o-mini"
+  timeout_sec: 90
+  max_retries: 2
+
+ui:
+  host: "127.0.0.1"
+  port: 8081
+
+logging:
+  level: "INFO"

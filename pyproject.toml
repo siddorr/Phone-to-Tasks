@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "call-assistant"
+version = "0.1.0"
+description = "Local-first call processing pipeline for transcripts, summaries, and tasks."
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110.0",
+  "jinja2>=3.1.0",
+  "openai>=1.0.0",
+  "openai-whisper",
+  "pydub",
+  "pyyaml",
+  "python-dotenv",
+  "python-multipart>=0.0.9",
+  "uvicorn>=0.27.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
