@@ -1,200 +1,151 @@
 # Backlog
 
-## Cross-Call Speaker Recognition
+This file tracks remaining product and engineering tasks.
 
-Status: partially implemented
-Priority: high
+Done items are listed briefly for context.
+Open items are the actual backlog to be implemented.
 
-### Summary
+## Done
 
-The codebase already has a working first version of cross-call speaker recognition:
+### Speaker identity foundation
 
-- per-call speaker clusters from diarization
-- a `speaker_identity` worker stage
-- speaker embeddings stored in SQLite
-- profile creation and assignment UI
-- speaker list/detail pages
+- added `speaker_identity` stage to the worker pipeline
+- added SQLite tables:
+  - `speaker_profiles`
+  - `speaker_embeddings`
+  - `speaker_assignments`
+- added speaker embedding and matching service
+- added call-detail speaker assignment UI
+- added `/speakers` and `/speakers/{speaker_identity_id}` pages
+- added tests for speaker identity flow
 
-What remains is mainly product hardening and profile-management UX.
+### Retranscription and processing controls
 
-### Already implemented
+- added retranscribe support with model selection
+- added batch retranscribe CLI
+- added manual processing controls in the UI
+- added full-call processing in manual-step mode
 
-#### Pipeline
+### Archive and ingest improvements
 
-- `speaker_identity` stage exists in the worker pipeline
-- current stage order:
-  - `audio_prepare`
-  - `transcription`
-  - `diarization`
-  - `speaker_identity`
-  - `transcript_clean`
-  - `analysis`
-  - `indexing`
+- added recorded-time resolution from filename / metadata / fallback
+- added recorded-time backfill CLI
+- added live incoming-folder scanning improvements
+- added duplicate-source-path short-circuiting
+- added stage-specific runtime states such as:
+  - `transcribing`
+  - `diarizing`
+  - `analyzing`
 
-#### Data model
+## Open
 
-SQLite tables already exist:
+### High priority
 
-- `speaker_profiles`
-- `speaker_embeddings`
-- `speaker_assignments`
+#### Speaker profiles: rename / hide / delete
 
-Transcript segment records already support:
+Status: not done
 
-- `speaker_cluster_id`
-- `speaker_identity_id`
-- `speaker_display_name`
-- `diarization_confidence`
-- `identity_confidence`
+Tasks:
 
-#### Matching implementation
+- add rename action for speaker profiles
+- add hide action for speaker profiles
+- add safe delete or archive flow for speaker profiles
+- define how deletes affect existing assignments and transcript display names
 
-Current backend:
+#### Suggested speaker matches in UI
 
-- pyannote-based embedding extraction
-- cosine similarity matching against confirmed profiles
+Status: partially done in backend, not done in UI
 
-Current config section exists:
+Tasks:
 
-```yaml
-speaker_identity:
-  enabled: true
-  provider: "pyannote"
-  auto_assign_threshold: 0.75
-  suggest_threshold: 0.60
-  min_cluster_duration_seconds: 6
-  continue_on_error: true
-```
+- surface `suggested` speaker matches on the call detail page
+- show suggested identity name and match score
+- add accept / reject actions for suggested matches
+- make suggested-vs-confirmed assignment visually clear
 
-Current behavior:
+#### Real-world validation of speaker identity quality
 
-- user assignment wins
-- high-confidence matches can auto-assign
-- midrange matches are stored as `suggested`
-- low-confidence matches stay unassigned
+Status: not done
 
-#### UI
+Tasks:
 
-Implemented UI surfaces:
+- evaluate matching quality on real calls
+- validate current thresholds:
+  - `auto_assign_threshold`
+  - `suggest_threshold`
+- document recommended threshold values
+- identify common false-match and missed-match cases
 
-- call detail page supports:
-  - assign existing speaker profile
-  - create and assign new speaker profile
-  - clear assignment
-- speaker profile list:
-  - `/speakers`
-- speaker profile detail:
-  - `/speakers/{speaker_identity_id}`
+### Medium priority
 
-#### Tests
+#### Limit embedding input size
 
-Implemented tests:
+Status: not done
 
-- `tests/test_speaker_identity.py`
+Tasks:
 
-### Remaining work
+- add `max_segments_per_cluster` behavior to speaker identity processing
+- decide whether to cap by:
+  - segment count
+  - total duration
+  - both
+- prefer representative segments instead of all segments for long speakers
 
-#### 1. Speaker profile management
+#### Better diarization observability
 
-Still needed:
+Status: partially done
 
-- rename speaker profile
-- hide speaker profile
-- delete or archive speaker profile safely
+Tasks:
 
-Current limitation:
+- make fallback diarization mode more visible in the UI
+- show whether diarization was:
+  - real clustered diarization
+  - single-speaker fallback
+- expose diarization confidence more clearly on the call page
 
-- profiles can be created and assigned
-- they cannot yet be managed after creation from the UI
+#### Speaker identity management on speaker pages
 
-#### 2. Suggested-match review UX
+Status: partially done
 
-Still needed:
+Tasks:
 
-- explicit UI for `suggested` matches
-- user-facing indication of:
-  - suggested identity
-  - confidence score
-  - accept/reject action
+- add profile notes editing
+- show more useful linked-call summaries
+- show assignment examples with timestamps or transcript excerpts
 
-Current limitation:
+### Low priority
 
-- the backend can distinguish suggested matches
-- the UI does not yet expose that flow clearly
+#### Alternative embedding backend
 
-#### 3. Embedding input control
+Status: not done
 
-Still needed:
+Tasks:
 
-- cap or sample segments per cluster before embedding
-- add and use `max_segments_per_cluster` in config if needed
+- evaluate a non-pyannote embedding backend
+- add backend abstraction if needed
+- keep pyannote as the default unless a better fallback is proven
 
-Reason:
+#### Backlog cleanup and structure
 
-- long clusters can become unnecessarily expensive
-- current backlog spec mentioned this, but the implementation does not yet enforce it
+Status: ongoing
 
-#### 4. Operational validation
+Tasks:
 
-Still needed:
+- keep this file as a task list, not a design document
+- move large design notes into separate docs if needed
+- keep each backlog item phrased as implementable work
 
-- validate speaker identity quality on real calls
-- confirm behavior when diarization falls back to single-speaker mode
-- measure whether auto-assignment thresholds are appropriate in practice
+## Next recommended milestone
 
-Reason:
-
-- the infrastructure exists
-- production behavior still needs tuning and evaluation
-
-#### 5. Optional backend fallback
-
-Nice-to-have, not required now:
-
-- alternative embedding backend such as SpeechBrain ECAPA
-
-Current state:
-
-- only pyannote is implemented
-
-### Current gaps versus the original design note
-
-These items from the old design note are not fully finished:
-
-- rename/hide/delete profile UX
-- richer suggested-match review
-- explicit `max_segments_per_cluster` handling
-- a second embedding backend
-
-Also, one detail changed from the original note:
-
-- assignment sources are currently:
-  - `auto`
-  - `user`
-  - `suggested`
-
-So the original note listing only `auto` and `user` is outdated.
-
-### Recommended next milestone
-
-#### Milestone: speaker identity UX completion
+### Speaker identity UX completion
 
 Goal:
 
-- make the existing speaker identity backend fully usable in the UI
+- make the existing speaker identity backend fully usable and reviewable in the UI
 
-Scope:
+Recommended scope:
 
-- rename profile
-- hide profile
-- surface suggested matches
-- allow accept/reject of suggested identity
-- show assignment confidence more clearly on call detail and speaker pages
-
-### Acceptance criteria for this backlog item to move from partial to complete
-
-- user can create, rename, hide, and review speaker profiles
-- suggested matches are visible and actionable in the UI
-- auto-assignment behavior is understandable and traceable
-- speaker identity results remain stable across multiple calls for confirmed profiles
-- backlog note matches actual implementation state
+- rename / hide speaker profiles
+- suggested-match review flow
+- clearer confidence display
+- better fallback-diarization visibility

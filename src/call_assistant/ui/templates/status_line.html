@@ -1,0 +1,76 @@
+<style>
+  .status-line { padding: 0.9rem 1rem; background: #fff; border: 1px solid #ddd4c7; margin-bottom: 1rem; display: grid; gap: 0.75rem; }
+  .status-line__top { display: flex; gap: 0.75rem; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+  .status-line__summary { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+  .status-line__group { display: flex; gap: 0.4rem; align-items: baseline; flex-wrap: wrap; }
+  .status-line__label { color: #5f5d55; font-size: 0.94rem; }
+  .status-line__task { display: flex; gap: 0.85rem; flex-wrap: wrap; align-items: center; }
+  .status-line__badge { display: inline-block; padding: 0.2rem 0.55rem; border-radius: 999px; background: #efe4c8; }
+  .status-line--Running .status-line__badge--app { background: #dcebd9; }
+  .status-line--Paused .status-line__badge--app { background: #f2e1b8; }
+  .status-line--Needs\ attention .status-line__badge--app { background: #f1d1cb; }
+  .status-line--Idle .status-line__badge--app,
+  .status-line--Backlog .status-line__badge--app { background: #e8e1d4; }
+  .status-line__actions form { margin: 0; }
+  .status-line__live-note { color: #8a5f17; font-size: 0.92rem; }
+</style>
+<div
+  id="app-status-line"
+  class="status-line status-line--{{ status_line.app_status|replace(' ', '-') }}"
+  data-status-url="/ui/status-line"
+  data-poll-interval="{{ status_line.poll_interval_seconds }}"
+>
+  <div class="status-line__top">
+    <div class="status-line__summary">
+      <span class="status-line__badge status-line__badge--app" id="status-app-status">{{ status_line.app_status }}</span>
+      <div class="status-line__group">
+        <span class="status-line__label">Mode</span>
+        <strong id="status-processing-mode">{{ status_line.processing_mode }}</strong>
+      </div>
+      <div class="status-line__group">
+        <span class="status-line__label">Running</span>
+        <strong id="status-running-count">{{ status_line.counts.running }}</strong>
+      </div>
+      <div class="status-line__group">
+        <span class="status-line__label">Queued</span>
+        <strong id="status-queued-count">{{ status_line.counts.queued }}</strong>
+      </div>
+      <div class="status-line__group">
+        <span class="status-line__label">Failed</span>
+        <strong id="status-failed-count">{{ status_line.counts.failed }}</strong>
+      </div>
+    </div>
+    <div class="status-line__actions" id="status-manual-button-container">
+      {% if status_line.processing_mode == 'manual_step' %}
+      <form method="post" action="/queue/process-next">
+        <button type="submit">Scan + Process Current Call</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+  <div class="status-line__task" id="status-current-task-container">
+    <div class="status-line__group">
+      <span class="status-line__label">Current task</span>
+      <strong id="status-current-task">{{ status_line.current_task.stage if status_line.current_task else 'No task running' }}</strong>
+    </div>
+    <div class="status-line__group" id="status-current-call-group" {% if not status_line.current_task %}style="display: none;"{% endif %}>
+      <span class="status-line__label">Call</span>
+      <a id="status-current-call-link" href="{{ status_line.current_task.call_url if status_line.current_task else '#' }}">{{ status_line.current_task.call_id if status_line.current_task else '' }}</a>
+    </div>
+    <div class="status-line__group" id="status-started-group" {% if not status_line.current_task %}style="display: none;"{% endif %}>
+      <span class="status-line__label">Started</span>
+      <strong id="status-started-at">{{ status_line.current_task.started_at_display if status_line.current_task else '-' }}</strong>
+    </div>
+    <div class="status-line__group" id="status-elapsed-group" {% if not status_line.current_task %}style="display: none;"{% endif %}>
+      <span class="status-line__label">Elapsed</span>
+      <strong id="status-elapsed">{{ status_line.current_task.elapsed_display if status_line.current_task else '-' }}</strong>
+    </div>
+    <div class="status-line__group" id="status-eta-group" {% if not status_line.current_task %}style="display: none;"{% endif %}>
+      <span class="status-line__label">ETA finish</span>
+      <strong id="status-eta">{{ status_line.current_task.estimated_finish_display if status_line.current_task else 'unknown' }}</strong>
+    </div>
+  </div>
+  <div class="status-line__group status-line__live-note" id="status-live-note-group" style="display: none;">
+    <span id="status-live-note">live status delayed</span>
+  </div>
+</div>

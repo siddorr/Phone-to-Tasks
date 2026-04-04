@@ -19,8 +19,14 @@ from call_assistant.speaker_identity.service import (
     _best_profile_match,
     _cosine_similarity,
     apply_identity_assignments,
+    archive_speaker_profile,
     assign_speaker_identity,
+    call_speaker_assignments,
+    accept_suggested_speaker_identity,
     create_speaker_profile,
+    list_assignable_speaker_profiles,
+    reject_suggested_speaker_identity,
+    rename_speaker_profile,
     run_speaker_identity_stage,
 )
 
@@ -147,9 +153,10 @@ speaker_identity:
             ],
         )
 
-        updated = run_speaker_identity_stage(self.config, call_dir, self.db)
+        result = run_speaker_identity_stage(self.config, call_dir, self.db)
 
-        self.assertEqual(updated[0]["speaker_identity_id"], None)
+        self.assertEqual(result.segments[0]["speaker_identity_id"], None)
+        self.assertEqual(result.outcome_status, "skipped")
         count = self.db.execute("SELECT COUNT(*) FROM speaker_embeddings").fetchone()[0]
         self.assertEqual(count, 0)
 
@@ -175,14 +182,169 @@ speaker_identity:
         )
 
         with patch("call_assistant.speaker_identity.service._compute_embedding", return_value=[1.0, 0.0]):
-            updated = run_speaker_identity_stage(self.config, call_dir, self.db)
+            result = run_speaker_identity_stage(self.config, call_dir, self.db)
 
-        self.assertEqual(updated[0]["speaker_identity_id"], speaker_id)
+        self.assertEqual(result.segments[0]["speaker_identity_id"], speaker_id)
+        self.assertEqual(result.outcome_status, "skipped")
         assignment = self.db.execute(
             "SELECT assignment_source FROM speaker_assignments WHERE call_id = ? AND speaker_cluster_id = ?",
             ("call_1", "speaker_1"),
         ).fetchone()
         self.assertEqual(assignment["assignment_source"], "user")
+
+    def test_speaker_identity_stage_is_degraded_when_embedding_fails(self) -> None:
+        call_dir = self._call_dir()
+        write_json(
+            call_dir / "transcript_segments.json",
+            [
+                {
+                    "segment_id": "seg_1",
+                    "start_sec": 0.0,
+                    "end_sec": 8.0,
+                    "speaker_label": "speaker_1",
+                    "speaker_channel_label": None,
+                    "text": "Hello",
+                    "confidence": None,
+                    "speaker_cluster_id": "speaker_1",
+                    "diarization_confidence": "medium",
+                }
+            ],
+        )
+
+        with patch("call_assistant.speaker_identity.service._compute_embedding", side_effect=RuntimeError("boom")):
+            result = run_speaker_identity_stage(self.config, call_dir, self.db)
+
+        self.assertEqual(result.outcome_status, "degraded")
+        self.assertIn("No embeddings produced", result.outcome_detail)
+
+    def test_speaker_identity_stage_creates_suggested_assignment_with_profile(self) -> None:
+        call_dir = self._call_dir()
+        speaker_id = create_speaker_profile(self.db, "Natasha")
+        self.db.execute(
+            """
+            INSERT INTO speaker_embeddings (
+                embedding_id, speaker_identity_id, call_id, speaker_cluster_id, segment_count,
+                duration_seconds, embedding_vector_json, model_name, confidence, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("emb-1", speaker_id, "call_a", "speaker_1", 3, 8.0, "[1.0, 0.0]", "test", 1.0, "now"),
+        )
+        self.db.commit()
+        write_json(
+            call_dir / "transcript_segments.json",
+            [
+                {
+                    "segment_id": "seg_1",
+                    "start_sec": 0.0,
+                    "end_sec": 8.0,
+                    "speaker_label": "speaker_1",
+                    "speaker_channel_label": None,
+                    "text": "Hello",
+                    "confidence": None,
+                    "speaker_cluster_id": "speaker_1",
+                    "diarization_confidence": "medium",
+                }
+            ],
+        )
+
+        with patch("call_assistant.speaker_identity.service._compute_embedding", return_value=[0.65, 0.76]):
+            result = run_speaker_identity_stage(self.config, call_dir, self.db)
+
+        self.assertEqual(result.outcome_status, "success")
+        self.assertEqual(result.suggested_cluster_count, 1)
+        row = self.db.execute(
+            """
+            SELECT speaker_identity_id, assignment_source
+            FROM speaker_assignments
+            WHERE call_id = ? AND speaker_cluster_id = ?
+            """,
+            ("call_1", "speaker_1"),
+        ).fetchone()
+        self.assertEqual(row["speaker_identity_id"], speaker_id)
+        self.assertEqual(row["assignment_source"], "suggested")
+
+    def test_rename_speaker_profile_updates_display_name(self) -> None:
+        speaker_id = create_speaker_profile(self.db, "Natasha")
+        rename_speaker_profile(self.db, speaker_id, "Nata")
+        row = self.db.execute(
+            "SELECT display_name FROM speaker_profiles WHERE speaker_identity_id = ?",
+            (speaker_id,),
+        ).fetchone()
+        self.assertEqual(row["display_name"], "Nata")
+
+    def test_archive_profile_excludes_from_assignable_profiles(self) -> None:
+        visible_id = create_speaker_profile(self.db, "Visible")
+        hidden_id = create_speaker_profile(self.db, "Hidden")
+        archive_speaker_profile(self.db, hidden_id)
+
+        profiles = list_assignable_speaker_profiles(self.db)
+
+        self.assertEqual([profile["speaker_identity_id"] for profile in profiles], [visible_id])
+
+    def test_accept_suggested_speaker_identity_converts_to_user_assignment(self) -> None:
+        call_dir = self._call_dir()
+        speaker_id = create_speaker_profile(self.db, "Natasha")
+        self.db.execute(
+            """
+            INSERT INTO speaker_assignments (
+                assignment_id, call_id, speaker_cluster_id, speaker_identity_id,
+                assignment_source, match_score, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("asg-suggested", "call_1", "speaker_1", speaker_id, "suggested", 0.67, "now", "now"),
+        )
+        self.db.commit()
+
+        accepted_id = accept_suggested_speaker_identity(self.config, call_dir, "speaker_1")
+
+        self.assertEqual(accepted_id, speaker_id)
+        row = self.db.execute(
+            "SELECT assignment_source, speaker_identity_id, match_score FROM speaker_assignments WHERE call_id = ? AND speaker_cluster_id = ?",
+            ("call_1", "speaker_1"),
+        ).fetchone()
+        self.assertEqual(row["assignment_source"], "user")
+        self.assertEqual(row["speaker_identity_id"], speaker_id)
+        self.assertEqual(row["match_score"], 0.67)
+
+    def test_reject_suggested_speaker_identity_removes_assignment(self) -> None:
+        call_dir = self._call_dir()
+        speaker_id = create_speaker_profile(self.db, "Natasha")
+        self.db.execute(
+            """
+            INSERT INTO speaker_assignments (
+                assignment_id, call_id, speaker_cluster_id, speaker_identity_id,
+                assignment_source, match_score, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("asg-suggested", "call_1", "speaker_1", speaker_id, "suggested", 0.67, "now", "now"),
+        )
+        self.db.commit()
+
+        reject_suggested_speaker_identity(self.config, call_dir, "speaker_1")
+
+        row = self.db.execute(
+            "SELECT COUNT(*) AS count FROM speaker_assignments WHERE call_id = ? AND speaker_cluster_id = ?",
+            ("call_1", "speaker_1"),
+        ).fetchone()
+        self.assertEqual(row["count"], 0)
+
+    def test_call_speaker_assignments_includes_display_name_and_source(self) -> None:
+        speaker_id = create_speaker_profile(self.db, "Natasha")
+        self.db.execute(
+            """
+            INSERT INTO speaker_assignments (
+                assignment_id, call_id, speaker_cluster_id, speaker_identity_id,
+                assignment_source, match_score, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("asg-1", "call_1", "speaker_1", speaker_id, "suggested", 0.62, "now", "now"),
+        )
+        self.db.commit()
+
+        assignments = call_speaker_assignments(self.db, "call_1")
+
+        self.assertEqual(assignments["speaker_1"]["display_name"], "Natasha")
+        self.assertEqual(assignments["speaker_1"]["assignment_source"], "suggested")
 
 
 if __name__ == "__main__":

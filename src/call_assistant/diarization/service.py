@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict, is_dataclass
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -129,9 +130,11 @@ def _align_turns_to_transcript_segments(
     return segments
 
 
-def apply_speaker_mapping(segments: list[dict], mapping: dict[str, str]) -> list[dict]:
+def apply_speaker_mapping(segments: list[dict | TranscriptSegment], mapping: dict[str, str]) -> list[dict]:
     normalized: list[dict] = []
     for item in segments:
+        if is_dataclass(item):
+            item = asdict(item)
         cluster_id = item.get("speaker_cluster_id") or item.get("speaker_label") or "speaker_1"
         item = {**item}
         item["speaker_cluster_id"] = cluster_id

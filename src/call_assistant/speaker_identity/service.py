@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-import tempfile
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
@@ -22,6 +21,20 @@ class MatchResult:
     speaker_identity_id: str | None
     match_score: float | None
     assignment_source: str | None
+
+
+@dataclass
+class SpeakerIdentityStageResult:
+    segments: list[dict]
+    cluster_count: int
+    eligible_cluster_count: int
+    embedded_cluster_count: int
+    skipped_cluster_count: int
+    failed_cluster_count: int
+    assigned_cluster_count: int
+    suggested_cluster_count: int
+    outcome_status: str
+    outcome_detail: str
 
 
 def _cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -47,6 +60,7 @@ def _cluster_duration(segments: list[TranscriptSegment]) -> float:
 def _compute_pyannote_embedding(audio_path: Path, spans: list[tuple[float, float]]) -> list[float] | None:
     from pydub import AudioSegment
     from pyannote.audio import Inference, Model
+    import torch
 
     audio = AudioSegment.from_file(audio_path)
     if not spans:
@@ -61,18 +75,17 @@ def _compute_pyannote_embedding(audio_path: Path, spans: list[tuple[float, float
         return None
 
     combined = combined.set_channels(1).set_frame_rate(16000)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
-        temp_path = Path(handle.name)
-    try:
-        combined.export(temp_path, format="wav")
-        model = Model.from_pretrained("pyannote/embedding")
-        inference = Inference(model, window="whole")
-        vector = inference(str(temp_path))
-        if hasattr(vector, "tolist"):
-            return [float(item) for item in vector.tolist()]
-        return [float(item) for item in vector]
-    finally:
-        temp_path.unlink(missing_ok=True)
+    sample_width = max(1, int(combined.sample_width))
+    max_value = float(1 << (8 * sample_width - 1))
+    samples = combined.get_array_of_samples()
+    waveform = torch.tensor(list(samples), dtype=torch.float32).unsqueeze(0) / max_value
+
+    model = Model.from_pretrained("pyannote/embedding")
+    inference = Inference(model, window="whole")
+    vector = inference({"waveform": waveform, "sample_rate": combined.frame_rate})
+    if hasattr(vector, "tolist"):
+        return [float(item) for item in vector.tolist()]
+    return [float(item) for item in vector]
 
 
 def _compute_embedding(
@@ -108,6 +121,16 @@ def _profile_name(db: sqlite3.Connection, speaker_identity_id: str | None) -> st
         (speaker_identity_id,),
     ).fetchone()
     return row["display_name"] if row else None
+
+
+def _profile_status(db: sqlite3.Connection, speaker_identity_id: str | None) -> str | None:
+    if not speaker_identity_id:
+        return None
+    row = db.execute(
+        "SELECT status FROM speaker_profiles WHERE speaker_identity_id = ?",
+        (speaker_identity_id,),
+    ).fetchone()
+    return row["status"] if row else None
 
 
 def _best_profile_match(db: sqlite3.Connection, embedding: list[float]) -> MatchResult:
@@ -226,21 +249,36 @@ def apply_identity_assignments(
     return updated
 
 
-def run_speaker_identity_stage(config: AppConfig, call_dir: Path, db: sqlite3.Connection | None = None) -> list[dict]:
+def run_speaker_identity_stage(
+    config: AppConfig,
+    call_dir: Path,
+    db: sqlite3.Connection | None = None,
+) -> SpeakerIdentityStageResult:
     connection = db or connect(config.sqlite_path)
     metadata = read_json(call_dir / "metadata.json", default={})
     call_id = metadata["call_id"]
     payload = read_json(call_dir / "transcript_segments.json", default=[])
     segments = [TranscriptSegment(**item) for item in payload]
     if not segments:
-        return []
+        return SpeakerIdentityStageResult([], 0, 0, 0, 0, 0, 0, 0, "skipped", "No transcript segments available")
 
     if not config.section("speaker_identity").get("enabled", True):
         updated = apply_identity_assignments(segments, connection, call_id)
         write_json(call_dir / "transcript_segments.json", updated)
         if db is None:
             connection.close()
-        return [segment.__dict__ for segment in updated]
+        return SpeakerIdentityStageResult(
+            [segment.__dict__ for segment in updated],
+            len(_clustered_segments(segments)),
+            0,
+            0,
+            len(_clustered_segments(segments)),
+            0,
+            0,
+            0,
+            "skipped",
+            "Speaker identity stage disabled",
+        )
 
     min_duration = float(config.section("speaker_identity").get("min_cluster_duration_seconds", 6))
     auto_threshold = float(config.section("speaker_identity").get("auto_assign_threshold", 0.75))
@@ -248,32 +286,47 @@ def run_speaker_identity_stage(config: AppConfig, call_dir: Path, db: sqlite3.Co
     model_name = f"{config.section('speaker_identity').get('provider', 'pyannote')}:embedding"
     grouped = _clustered_segments(segments)
     audio_path = call_dir / "audio_normalized.wav"
+    embedded_cluster_count = 0
+    skipped_cluster_count = 0
+    failed_cluster_count = 0
+    assigned_cluster_count = 0
+    suggested_cluster_count = 0
+    eligible_cluster_count = 0
 
     for cluster_id, cluster_segments in grouped.items():
         user_assignment = _existing_user_assignment(connection, call_id, cluster_id)
         if user_assignment:
+            assigned_cluster_count += 1
             continue
         duration = _cluster_duration(cluster_segments)
         if duration < min_duration:
+            skipped_cluster_count += 1
             continue
+        eligible_cluster_count += 1
         try:
             embedding = _compute_embedding(audio_path, cluster_segments, config)
         except Exception:
             logger.exception("Speaker identity embedding failed call_id=%s cluster=%s", call_id, cluster_id)
+            failed_cluster_count += 1
             if not config.section("speaker_identity").get("continue_on_error", True):
                 raise
             continue
         if not embedding:
+            failed_cluster_count += 1
             continue
+        embedded_cluster_count += 1
         match = _best_profile_match(connection, embedding)
         assigned_identity_id: str | None = None
         assignment_source = "auto"
         match_score = match.match_score
         if match.match_score is not None and match.match_score >= auto_threshold:
             assigned_identity_id = match.speaker_identity_id
+            if assigned_identity_id:
+                assigned_cluster_count += 1
         elif match.match_score is not None and match.match_score >= suggest_threshold:
-            assigned_identity_id = None
+            assigned_identity_id = match.speaker_identity_id
             assignment_source = "suggested"
+            suggested_cluster_count += 1
         else:
             assigned_identity_id = None
         _upsert_embedding(
@@ -300,7 +353,44 @@ def run_speaker_identity_stage(config: AppConfig, call_dir: Path, db: sqlite3.Co
     connection.commit()
     if db is None:
         connection.close()
-    return [segment.__dict__ for segment in updated]
+    cluster_count = len(grouped)
+    if failed_cluster_count:
+        if eligible_cluster_count and embedded_cluster_count == 0:
+            outcome_status = "degraded"
+            outcome_detail = "No embeddings produced; continued without identity enrichment"
+        else:
+            outcome_status = "degraded"
+            outcome_detail = f"{failed_cluster_count} cluster(s) failed embedding"
+    elif eligible_cluster_count == 0:
+        outcome_status = "skipped"
+        outcome_detail = "No eligible speaker clusters for identity matching"
+    else:
+        outcome_status = "success"
+        outcome_detail = "Speaker identity matching completed"
+    logger.info(
+        "Stage speaker_identity result call_id=%s clusters=%s eligible=%s embedded=%s failed=%s assigned=%s suggested=%s outcome=%s detail=%s",
+        call_id,
+        cluster_count,
+        eligible_cluster_count,
+        embedded_cluster_count,
+        failed_cluster_count,
+        assigned_cluster_count,
+        suggested_cluster_count,
+        outcome_status,
+        outcome_detail,
+    )
+    return SpeakerIdentityStageResult(
+        segments=[segment.__dict__ for segment in updated],
+        cluster_count=cluster_count,
+        eligible_cluster_count=eligible_cluster_count,
+        embedded_cluster_count=embedded_cluster_count,
+        skipped_cluster_count=skipped_cluster_count,
+        failed_cluster_count=failed_cluster_count,
+        assigned_cluster_count=assigned_cluster_count,
+        suggested_cluster_count=suggested_cluster_count,
+        outcome_status=outcome_status,
+        outcome_detail=outcome_detail,
+    )
 
 
 def refresh_segments_with_assignments(config: AppConfig, call_dir: Path) -> list[dict]:
@@ -327,6 +417,25 @@ def create_speaker_profile(db: sqlite3.Connection, display_name: str, notes: str
     return speaker_identity_id
 
 
+def rename_speaker_profile(db: sqlite3.Connection, speaker_identity_id: str, display_name: str) -> None:
+    normalized = display_name.strip()
+    if not normalized:
+        raise ValueError("Display name is required")
+    db.execute(
+        "UPDATE speaker_profiles SET display_name = ?, updated_at = ? WHERE speaker_identity_id = ?",
+        (normalized, utc_now(), speaker_identity_id),
+    )
+    db.commit()
+
+
+def archive_speaker_profile(db: sqlite3.Connection, speaker_identity_id: str) -> None:
+    db.execute(
+        "UPDATE speaker_profiles SET status = 'hidden', updated_at = ? WHERE speaker_identity_id = ?",
+        (utc_now(), speaker_identity_id),
+    )
+    db.commit()
+
+
 def assign_speaker_identity(
     config: AppConfig,
     call_dir: Path,
@@ -336,6 +445,9 @@ def assign_speaker_identity(
 ) -> None:
     db = connect(config.sqlite_path)
     metadata = read_json(call_dir / "metadata.json", default={})
+    if _profile_status(db, speaker_identity_id) != "confirmed":
+        db.close()
+        raise ValueError("Speaker profile must be confirmed before assignment")
     _upsert_assignment(
         db,
         call_id=metadata["call_id"],
@@ -344,6 +456,55 @@ def assign_speaker_identity(
         assignment_source=assignment_source,
         match_score=1.0 if assignment_source == "user" else None,
     )
+    db.commit()
+    db.close()
+
+
+def accept_suggested_speaker_identity(config: AppConfig, call_dir: Path, cluster_id: str) -> str:
+    db = connect(config.sqlite_path)
+    metadata = read_json(call_dir / "metadata.json", default={})
+    assignment = db.execute(
+        """
+        SELECT speaker_identity_id, assignment_source, match_score
+        FROM speaker_assignments
+        WHERE call_id = ? AND speaker_cluster_id = ?
+        """,
+        (metadata["call_id"], cluster_id),
+    ).fetchone()
+    if not assignment or assignment["assignment_source"] != "suggested" or not assignment["speaker_identity_id"]:
+        db.close()
+        raise ValueError("No suggested assignment available")
+    if _profile_status(db, assignment["speaker_identity_id"]) != "confirmed":
+        db.close()
+        raise ValueError("Suggested speaker profile is not assignable")
+    _upsert_assignment(
+        db,
+        call_id=metadata["call_id"],
+        cluster_id=cluster_id,
+        speaker_identity_id=assignment["speaker_identity_id"],
+        assignment_source="user",
+        match_score=assignment["match_score"],
+    )
+    db.commit()
+    db.close()
+    return assignment["speaker_identity_id"]
+
+
+def reject_suggested_speaker_identity(config: AppConfig, call_dir: Path, cluster_id: str) -> None:
+    db = connect(config.sqlite_path)
+    metadata = read_json(call_dir / "metadata.json", default={})
+    assignment = db.execute(
+        """
+        SELECT assignment_id, assignment_source
+        FROM speaker_assignments
+        WHERE call_id = ? AND speaker_cluster_id = ?
+        """,
+        (metadata["call_id"], cluster_id),
+    ).fetchone()
+    if not assignment or assignment["assignment_source"] != "suggested":
+        db.close()
+        raise ValueError("No suggested assignment available")
+    db.execute("DELETE FROM speaker_assignments WHERE assignment_id = ?", (assignment["assignment_id"],))
     db.commit()
     db.close()
 
@@ -370,6 +531,39 @@ def list_speaker_profiles(db: sqlite3.Connection) -> list[dict]:
         """
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def list_assignable_speaker_profiles(db: sqlite3.Connection) -> list[dict]:
+    rows = db.execute(
+        """
+        SELECT p.*, COUNT(DISTINCT a.call_id) AS linked_calls, MAX(a.updated_at) AS last_seen
+        FROM speaker_profiles p
+        LEFT JOIN speaker_assignments a ON a.speaker_identity_id = p.speaker_identity_id
+        WHERE p.status = 'confirmed'
+        GROUP BY p.speaker_identity_id
+        ORDER BY p.display_name COLLATE NOCASE ASC
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def call_speaker_assignments(db: sqlite3.Connection, call_id: str) -> dict[str, dict]:
+    rows = db.execute(
+        """
+        SELECT
+            a.speaker_cluster_id,
+            a.speaker_identity_id,
+            a.assignment_source,
+            a.match_score,
+            p.display_name,
+            p.status AS profile_status
+        FROM speaker_assignments a
+        LEFT JOIN speaker_profiles p ON p.speaker_identity_id = a.speaker_identity_id
+        WHERE a.call_id = ?
+        """,
+        (call_id,),
+    ).fetchall()
+    return {row["speaker_cluster_id"]: dict(row) for row in rows}
 
 
 def speaker_profile_detail(db: sqlite3.Connection, speaker_identity_id: str) -> dict[str, object] | None:

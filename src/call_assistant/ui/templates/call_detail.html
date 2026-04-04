@@ -19,8 +19,8 @@
       .inline-form { display: grid; grid-template-columns: 1fr auto; gap: 0.5rem; align-items: end; }
       .triple-form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 0.5rem; align-items: end; }
       .notice { padding: 0.8rem 1rem; background: #e9f3e4; border: 1px solid #b8d2aa; margin-bottom: 1rem; }
-      .mode { padding: 0.8rem 1rem; background: #fff; border: 1px solid #ddd4c7; margin-bottom: 1rem; display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
       .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; background: #efe4c8; }
+      .status-badges { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.35rem 0; }
     </style>
   </head>
   <body>
@@ -29,15 +29,7 @@
     {% if notice %}
     <div class="notice">{{ notice }}</div>
     {% endif %}
-    <div class="mode">
-      <strong>Processing mode:</strong>
-      <span class="badge">{{ processing_mode }}</span>
-      {% if processing_mode == 'manual_step' %}
-      <form method="post" action="/queue/process-next">
-        <button type="submit">Scan + Process One Job</button>
-      </form>
-      {% endif %}
-    </div>
+    {% include "status_line.html" %}
     <section>
       <h2>Metadata</h2>
       <pre>{{ metadata | tojson(indent=2) }}</pre>
@@ -63,6 +55,30 @@
       </div>
     </section>
     <section>
+      <h2>Pipeline Status</h2>
+      <div class="status-badges">
+        <span class="badge">state {{ call.current_state }}</span>
+        {% if metadata.last_blocking_stage %}
+        <span class="badge">blocked at {{ metadata.last_blocking_stage }}</span>
+        {% endif %}
+        {% if speaker_identity_mode %}
+        <span class="badge">speaker identity {{ speaker_identity_mode }}</span>
+        {% endif %}
+      </div>
+      {% if metadata.last_blocking_error %}
+      <div><strong>Last blocking error:</strong> {{ metadata.last_blocking_error }}</div>
+      {% endif %}
+      {% if speaker_identity_notice %}
+      <div><strong>Speaker identity:</strong> {{ speaker_identity_notice }}</div>
+      {% endif %}
+      {% if queue_statuses %}
+      <div style="margin-top: 0.75rem;">
+        <strong>Recent queue entries</strong>
+        <pre>{{ queue_statuses | tojson(indent=2) }}</pre>
+      </div>
+      {% endif %}
+    </section>
+    <section>
       <h2>Audio</h2>
       {% if audio_url %}
       <div class="audio-panel">
@@ -85,6 +101,15 @@
         <pre>{{ transcript_clean }}</pre>
       </section>
     </div>
+    {% if diarization_notice %}
+    <section>
+      <h2>Diarization</h2>
+      <div class="status-badges">
+        <span class="badge">{{ diarization_mode }}</span>
+      </div>
+      <div>{{ diarization_notice }}</div>
+    </section>
+    {% endif %}
     <section>
       <h2>Synced Transcript Segments</h2>
       {% if segment_view %}
@@ -99,6 +124,9 @@
           <div class="segment-meta">
             <span>[{{ segment.display_timestamp }}]</span>
             <span>{{ segment.display_speaker }}</span>
+            {% if segment.assignment_source %}
+            <span>{{ cluster_status_label(segment.assignment_source, segment.speaker_identity_id) }}</span>
+            {% endif %}
             {% if segment.identity_confidence is not none %}
             <span>match={{ "%.2f"|format(segment.identity_confidence) }}</span>
             {% endif %}
@@ -137,17 +165,35 @@
       {% if speaker_clusters %}
       {% for cluster_id in speaker_clusters %}
       {% set cluster_segment = (segment_view | selectattr('speaker_cluster_id', 'equalto', cluster_id) | list | first) %}
+      {% set assignment = assignment_by_cluster.get(cluster_id, {}) %}
       <div class="task">
         <strong>{{ cluster_id }}</strong>
-        <div>Current identity: {{ cluster_segment.speaker_display_name if cluster_segment and cluster_segment.speaker_identity_id else 'Unassigned' }}</div>
-        {% if cluster_segment and cluster_segment.identity_confidence is not none %}
-        <div>Last match score: {{ "%.2f"|format(cluster_segment.identity_confidence) }}</div>
+        <div>Current identity: {{ assignment.display_name if assignment.get('speaker_identity_id') else 'Unassigned' }}</div>
+        <div class="status-badges">
+          <span class="badge">{{ cluster_status_label(assignment.get('assignment_source'), assignment.get('speaker_identity_id')) }}</span>
+          {% if cluster_segment and cluster_segment.diarization_confidence %}
+          <span class="badge">diarization {{ cluster_segment.diarization_confidence }}</span>
+          {% endif %}
+        </div>
+        {% if assignment.get('match_score') is not none %}
+        <div>Last match score: {{ "%.2f"|format(assignment.get('match_score')) }}</div>
+        {% endif %}
+        {% if assignment.get('assignment_source') == 'suggested' and assignment.get('speaker_identity_id') %}
+        <div>Suggested identity: {{ assignment.get('display_name') or 'Unknown profile' }}</div>
+        <form method="post" action="/calls/{{ call.call_id }}/speakers/accept-suggestion" class="inline-form">
+          <input type="hidden" name="speaker_cluster_id" value="{{ cluster_id }}">
+          <button type="submit">Accept suggestion</button>
+        </form>
+        <form method="post" action="/calls/{{ call.call_id }}/speakers/reject-suggestion">
+          <input type="hidden" name="speaker_cluster_id" value="{{ cluster_id }}">
+          <button type="submit">Reject suggestion</button>
+        </form>
         {% endif %}
         <form method="post" action="/calls/{{ call.call_id }}/speakers/assign" class="inline-form">
           <input type="hidden" name="speaker_cluster_id" value="{{ cluster_id }}">
           <select name="speaker_identity_id">
             {% for profile in speaker_profiles %}
-            <option value="{{ profile.speaker_identity_id }}" {% if cluster_segment and cluster_segment.speaker_identity_id == profile.speaker_identity_id %}selected{% endif %}>{{ profile.display_name }}</option>
+            <option value="{{ profile.speaker_identity_id }}" {% if assignment.get('speaker_identity_id') == profile.speaker_identity_id %}selected{% endif %}>{{ profile.display_name }}</option>
             {% endfor %}
           </select>
           <button type="submit">Assign existing</button>
@@ -203,7 +249,7 @@
       <h2>Processing Log</h2>
       <pre>{{ processing_log | tojson(indent=2) }}</pre>
     </section>
-    <script>
+<script>
       (() => {
         const audio = document.getElementById("call-audio");
         const segmentNodes = Array.from(document.querySelectorAll(".segment-line"));
@@ -248,7 +294,8 @@
             }
           });
         });
-      })();
-    </script>
+})();
+</script>
+    {% include "status_line_script.html" %}
   </body>
 </html>

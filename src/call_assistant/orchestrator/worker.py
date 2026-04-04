@@ -9,7 +9,7 @@ from call_assistant.analysis.service import analyze_call
 from call_assistant.audio.normalize import normalize_audio
 from call_assistant.common.config import AppConfig
 from call_assistant.common.io import append_log, read_json, write_json
-from call_assistant.common.models import AnalysisBundle, artifact_paths
+from call_assistant.common.models import AnalysisBundle, TranscriptSegment, artifact_paths, utc_now
 from call_assistant.diarization.service import diarize
 from call_assistant.indexing.service import index_call
 from call_assistant.ingest.watcher import detect_new_calls
@@ -27,6 +27,16 @@ STAGE_SEQUENCE = {
     "speaker_identity": "transcript_clean",
     "transcript_clean": "analysis",
     "analysis": "indexing",
+}
+
+LAST_STABLE_STATE = {
+    "audio_prepare": "imported",
+    "transcription": "audio_prepared",
+    "diarization": "transcribed",
+    "speaker_identity": "diarized",
+    "transcript_clean": "speaker_identity",
+    "analysis": "transcript_clean",
+    "indexing": "analyzed",
 }
 
 IN_PROGRESS_STATE = {
@@ -60,10 +70,32 @@ def _update_metadata(call_dir: Path, **updates: object) -> dict:
     return metadata
 
 
+def _record_stage_outcome(call_dir: Path, stage: str, status: str, detail: str) -> dict:
+    metadata = read_json(call_dir / "metadata.json", default={})
+    outcomes = metadata.setdefault("stage_outcomes", {})
+    outcomes[stage] = {"status": status, "detail": detail, "at": utc_now()}
+    metadata["stage_outcomes"] = outcomes
+    write_json(call_dir / "metadata.json", metadata)
+    return metadata
+
+
+def _set_blocking_state(call_dir: Path, stage: str | None, error: str | None) -> dict:
+    metadata = read_json(call_dir / "metadata.json", default={})
+    metadata["last_blocking_stage"] = stage
+    metadata["last_blocking_error"] = error
+    write_json(call_dir / "metadata.json", metadata)
+    return metadata
+
+
 def _sync_call_row(config: AppConfig, call_dir: Path) -> None:
     # Reindexing from canonical artifact files keeps SQLite state consistent
     # with the archive even if intermediate stage metadata changes.
     index_call(call_dir, config)
+
+
+def _require_artifact(path: Path, stage: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"{stage} requires artifact {path.name}")
 
 
 def _process_audio_prepare(config: AppConfig, call_dir: Path) -> None:
@@ -76,6 +108,7 @@ def _process_audio_prepare(config: AppConfig, call_dir: Path) -> None:
         audio_format=audio_metadata.audio_format,
         duration_seconds=audio_metadata.duration_seconds,
     )
+    _record_stage_outcome(call_dir, "audio_prepare", "success", "Audio normalization completed")
     _sync_call_row(config, call_dir)
     logger.info("Stage audio_prepare success call_dir=%s duration_seconds=%s format=%s", call_dir, audio_metadata.duration_seconds, audio_metadata.audio_format)
 
@@ -83,6 +116,7 @@ def _process_audio_prepare(config: AppConfig, call_dir: Path) -> None:
 def _process_transcription(config: AppConfig, call_dir: Path) -> None:
     logger.info("Stage transcription start call_dir=%s", call_dir)
     audio_path = call_dir / "audio_normalized.wav"
+    _require_artifact(audio_path, "transcription")
     default_provider, model_override, language_override, language_mode = _transcription_preferences(audio_path, config)
     raw = transcribe(audio_path, config)
     write_json(call_dir / "transcript_raw.json", raw)
@@ -98,13 +132,16 @@ def _process_transcription(config: AppConfig, call_dir: Path) -> None:
         transcription_language_mode=language_mode,
         mixed_language_suspected=_looks_mixed_language_problem(raw, audio_path),
     )
+    _record_stage_outcome(call_dir, "transcription", "success", f"Transcription produced {len(raw.segments)} segment(s)")
     _sync_call_row(config, call_dir)
     logger.info("Stage transcription success call_dir=%s provider=%s segments=%s", call_dir, raw.provider, len(raw.segments))
 
 
 def _process_diarization(config: AppConfig, call_dir: Path) -> None:
     logger.info("Stage diarization start call_dir=%s", call_dir)
-    raw = read_json(call_dir / "transcript_raw.json", default={})
+    transcript_raw_path = call_dir / "transcript_raw.json"
+    _require_artifact(transcript_raw_path, "diarization")
+    raw = read_json(transcript_raw_path, default={})
     metadata = read_json(call_dir / "metadata.json", default={})
     normalized = transcribe_data_to_segments(
         raw,
@@ -113,7 +150,18 @@ def _process_diarization(config: AppConfig, call_dir: Path) -> None:
         metadata.get("speaker_mapping"),
     )
     write_json(call_dir / "transcript_segments.json", normalized)
-    metadata = _update_metadata(call_dir, current_state="diarized")
+    diarization_mode = (
+        "single_speaker_fallback"
+        if len({item.speaker_cluster_id for item in normalized}) <= 1
+        else "clustered"
+    )
+    metadata = _update_metadata(call_dir, current_state="diarized", diarization_mode=diarization_mode)
+    _record_stage_outcome(
+        call_dir,
+        "diarization",
+        "degraded" if diarization_mode == "single_speaker_fallback" else "success",
+        "Diarization used single-speaker fallback" if diarization_mode == "single_speaker_fallback" else "Diarization produced speaker clusters",
+    )
     _sync_call_row(config, call_dir)
     logger.info("Stage diarization success call_dir=%s segments=%s", call_dir, len(normalized))
 
@@ -148,30 +196,55 @@ def transcribe_data_to_segments(
 
 def _process_transcript_clean(config: AppConfig, call_dir: Path) -> None:
     logger.info("Stage transcript_clean start call_dir=%s", call_dir)
-    payload = read_json(call_dir / "transcript_segments.json", default=[])
+    segments_path = call_dir / "transcript_segments.json"
+    _require_artifact(segments_path, "transcript_clean")
+    payload = read_json(segments_path, default=[])
     segments = [TranscriptSegment(**item) for item in payload]
     clean = clean_transcript(segments)
     (call_dir / "transcript_clean.txt").write_text(clean.text, encoding="utf-8")
     metadata = _update_metadata(call_dir, current_state="transcript_clean")
+    _record_stage_outcome(call_dir, "transcript_clean", "success", f"Transcript cleaned with {len(segments)} segment(s)")
     _sync_call_row(config, call_dir)
     logger.info("Stage transcript_clean success call_dir=%s segment_count=%s", call_dir, len(segments))
 
 
 def _process_speaker_identity(config: AppConfig, call_dir: Path) -> None:
     logger.info("Stage speaker_identity start call_dir=%s", call_dir)
-    updated = run_speaker_identity_stage(config, call_dir)
-    _update_metadata(call_dir, current_state="speaker_identity")
+    _require_artifact(call_dir / "transcript_segments.json", "speaker_identity")
+    result = run_speaker_identity_stage(config, call_dir)
+    identity_mode = {
+        "success": "full",
+        "degraded": "degraded",
+        "skipped": "skipped",
+    }.get(result.outcome_status, "degraded")
+    _update_metadata(
+        call_dir,
+        current_state="speaker_identity",
+        speaker_identity_mode=identity_mode,
+        speaker_identity_summary=result.outcome_detail,
+    )
+    _record_stage_outcome(call_dir, "speaker_identity", result.outcome_status, result.outcome_detail)
     _sync_call_row(config, call_dir)
-    logger.info("Stage speaker_identity success call_dir=%s segments=%s", call_dir, len(updated))
+    logger.info(
+        "Stage speaker_identity success call_dir=%s segments=%s outcome=%s detail=%s",
+        call_dir,
+        len(result.segments),
+        result.outcome_status,
+        result.outcome_detail,
+    )
 
 
 def _process_analysis(config: AppConfig, call_dir: Path) -> None:
-    from call_assistant.common.models import TranscriptSegment, CleanTranscript
+    from call_assistant.common.models import CleanTranscript
 
     logger.info("Stage analysis start call_dir=%s", call_dir)
-    payload = read_json(call_dir / "transcript_segments.json", default=[])
+    segments_path = call_dir / "transcript_segments.json"
+    clean_path = call_dir / "transcript_clean.txt"
+    _require_artifact(segments_path, "analysis")
+    _require_artifact(clean_path, "analysis")
+    payload = read_json(segments_path, default=[])
     segments = [TranscriptSegment(**item) for item in payload]
-    text = (call_dir / "transcript_clean.txt").read_text(encoding="utf-8")
+    text = clean_path.read_text(encoding="utf-8")
     clean = CleanTranscript(text=text, segments=segments)
     analysis = analyze_call(clean, segments, config)
     write_json(call_dir / "summary.json", analysis)
@@ -180,6 +253,12 @@ def _process_analysis(config: AppConfig, call_dir: Path) -> None:
     metadata["current_state"] = "analyzed"
     metadata["low_confidence"] = bool(metadata.get("low_confidence")) or bool(analysis.low_confidence_reason)
     write_json(call_dir / "metadata.json", metadata)
+    _record_stage_outcome(
+        call_dir,
+        "analysis",
+        "degraded" if analysis.low_confidence_reason else "success",
+        analysis.low_confidence_reason or "Analysis completed",
+    )
     _sync_call_row(config, call_dir)
     logger.info("Stage analysis success call_dir=%s task_count=%s confidence=%s", call_dir, len(analysis.tasks), analysis.analysis_confidence)
 
@@ -189,6 +268,7 @@ def _process_indexing(config: AppConfig, call_dir: Path) -> None:
     metadata = read_json(call_dir / "metadata.json", default={})
     metadata["current_state"] = "indexed"
     write_json(call_dir / "metadata.json", metadata)
+    _record_stage_outcome(call_dir, "indexing", "success", "Indexing completed")
     _sync_call_row(config, call_dir)
     index_call(call_dir, config)
     logger.info("Stage indexing success call_dir=%s", call_dir)
@@ -199,6 +279,7 @@ def process_job(config: AppConfig, job) -> None:
     current_state = IN_PROGRESS_STATE.get(job.stage)
     if current_state:
         _update_metadata(call_dir, current_state=current_state)
+        _set_blocking_state(call_dir, None, None)
         _sync_call_row(config, call_dir)
     append_log(call_dir / "processing_log.json", {"event": f"{job.stage}_started", "at": job.started_at})
     if job.stage == "audio_prepare":
@@ -227,6 +308,12 @@ def _run_claimed_job(config: AppConfig, job) -> bool:
     logger.info("Worker claimed job_id=%s call_id=%s stage=%s attempt=%s", job.job_id, job.call_id, job.stage, job.attempt_count)
     try:
         process_job(config, job)
+        call_dir = _call_dir(config, job.call_id)
+        metadata = read_json(call_dir / "metadata.json", default={})
+        if metadata.get("errors"):
+            metadata["errors"] = []
+            write_json(call_dir / "metadata.json", metadata)
+            _sync_call_row(config, call_dir)
         complete_job(config, job.job_id)
         return True
     except Exception as exc:
@@ -234,7 +321,16 @@ def _run_claimed_job(config: AppConfig, job) -> bool:
         call_dir = _call_dir(config, job.call_id)
         metadata = read_json(call_dir / "metadata.json", default={})
         metadata.setdefault("errors", []).append(str(exc))
-        metadata["current_state"] = "failed"
+        next_status = "queued" if job.attempt_count < job.max_attempts else "failed"
+        metadata["current_state"] = "failed" if next_status == "failed" else LAST_STABLE_STATE.get(job.stage, metadata.get("current_state", "failed"))
+        metadata["last_blocking_stage"] = job.stage
+        metadata["last_blocking_error"] = str(exc)
+        outcomes = metadata.setdefault("stage_outcomes", {})
+        outcomes[job.stage] = {
+            "status": "failed_terminal" if next_status == "failed" else "failed_retryable",
+            "detail": str(exc),
+            "at": utc_now(),
+        }
         write_json(call_dir / "metadata.json", metadata)
         _sync_call_row(config, call_dir)
         append_log(call_dir / "processing_log.json", {"event": f"{job.stage}_failed", "error": str(exc)})

@@ -11,7 +11,6 @@
       a { color: #234f3d; text-decoration: none; }
       pre { white-space: pre-wrap; }
       .notice { padding: 0.8rem 1rem; background: #e9f3e4; border: 1px solid #b8d2aa; margin-bottom: 1rem; }
-      .mode { padding: 0.8rem 1rem; background: #fff; border: 1px solid #ddd4c7; margin-bottom: 1rem; display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
       .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; background: #efe4c8; }
     </style>
   </head>
@@ -21,18 +20,20 @@
     {% if notice %}
     <div class="notice">{{ notice }}</div>
     {% endif %}
-    <div class="mode">
-      <strong>Processing mode:</strong>
-      <span class="badge">{{ processing_mode }}</span>
-      {% if processing_mode == 'manual_step' %}
-      <form method="post" action="/queue/process-next">
-        <button type="submit">Scan + Process One Job</button>
-      </form>
-      {% endif %}
-    </div>
+    {% include "status_line.html" %}
     <section>
       <h2>Profile</h2>
       <pre>{{ profile | tojson(indent=2) }}</pre>
+      <form method="post" action="/speakers/{{ profile.speaker_identity_id }}/rename">
+        <label>Display name</label>
+        <input type="text" name="display_name" value="{{ profile.display_name }}">
+        <button type="submit">Rename</button>
+      </form>
+      {% if profile.status != 'hidden' %}
+      <form method="post" action="/speakers/{{ profile.speaker_identity_id }}/archive">
+        <button type="submit">Archive profile</button>
+      </form>
+      {% endif %}
     </section>
     <section>
       <h2>Assignments</h2>
@@ -40,8 +41,10 @@
         <thead>
           <tr>
             <th>Call</th>
+            <th>Filename</th>
+            <th>Recorded</th>
             <th>Cluster</th>
-            <th>Source</th>
+            <th>Assignment</th>
             <th>Score</th>
             <th>When</th>
           </tr>
@@ -50,16 +53,19 @@
           {% for assignment in assignments %}
           <tr>
             <td><a href="/calls/{{ assignment.call_id }}">{{ assignment.call_id }}</a></td>
+            <td>{{ assignment.source_filename }}</td>
+            <td>{{ assignment.recorded_at or assignment.imported_at or '-' }}</td>
             <td>{{ assignment.speaker_cluster_id }}</td>
             <td>{{ assignment.assignment_source }}</td>
             <td>{{ assignment.match_score if assignment.match_score is not none else '-' }}</td>
             <td>{{ assignment.updated_at }}</td>
           </tr>
           {% else %}
-          <tr><td colspan="5">No assignments yet.</td></tr>
+          <tr><td colspan="7">No assignments yet.</td></tr>
           {% endfor %}
         </tbody>
       </table>
     </section>
+    {% include "status_line_script.html" %}
   </body>
 </html>

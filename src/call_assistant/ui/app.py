@@ -24,10 +24,16 @@ from call_assistant.orchestrator.worker import processing_mode, run_manual_step
 from call_assistant.reprocess import reset_call_for_retranscription, transcription_choices
 from call_assistant.reprocess import transcription_language_choices
 from call_assistant.speaker_identity.service import (
+    accept_suggested_speaker_identity,
+    archive_speaker_profile,
     assign_speaker_identity,
+    call_speaker_assignments,
     clear_speaker_identity,
     create_speaker_profile,
+    list_assignable_speaker_profiles,
     list_speaker_profiles,
+    rename_speaker_profile,
+    reject_suggested_speaker_identity,
     refresh_segments_with_assignments,
     speaker_profile_detail,
 )
@@ -50,6 +56,19 @@ ALLOWED_RECENT_FILTERS = {
     "3d": timedelta(days=3),
     "7d": timedelta(days=7),
     "30d": timedelta(days=30),
+}
+
+STATUS_POLL_INTERVAL_SECONDS = 5
+ETA_RECALC_MIN_SECONDS = 15.0
+ETA_RECALC_MAX_SECONDS = 300.0
+STAGE_DEFAULT_RUNTIME_SECONDS = {
+    "audio_prepare": 30.0,
+    "transcription": 180.0,
+    "diarization": 300.0,
+    "speaker_identity": 45.0,
+    "transcript_clean": 15.0,
+    "analysis": 45.0,
+    "indexing": 15.0,
 }
 
 
@@ -119,6 +138,24 @@ def _format_duration(duration_seconds: float | None) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
+def _format_local_timestamp(value: str | None) -> str:
+    parsed = _parse_timestamp(value)
+    if not parsed:
+        return "-"
+    local = parsed.astimezone()
+    return local.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+
+
 def _preferred_audio_path(call_dir: Path) -> Path | None:
     originals = sorted(call_dir.glob("audio_original.*"))
     if originals:
@@ -148,6 +185,246 @@ def _segment_view(segments: list[dict]) -> list[dict]:
             }
         )
     return view
+
+
+def _diarization_context(processing_log: list[dict], segments: list[dict]) -> dict[str, str | None]:
+    for event in reversed(processing_log):
+        if event.get("event") == "fallback_diarization_completed" and event.get("mode") == "single_speaker":
+            return {
+                "diarization_mode": "single_speaker_fallback",
+                "diarization_notice": "Diarization used single-speaker fallback for this call.",
+            }
+    if segments:
+        return {
+            "diarization_mode": "clustered",
+            "diarization_notice": "Diarization produced speaker clusters for this call.",
+        }
+    return {"diarization_mode": "unknown", "diarization_notice": None}
+
+
+def _speaker_identity_context(metadata: dict, assignments: dict[str, dict]) -> dict[str, str | None]:
+    mode = metadata.get("speaker_identity_mode")
+    summary = metadata.get("speaker_identity_summary")
+    if mode or summary:
+        return {"speaker_identity_mode": mode, "speaker_identity_notice": summary}
+    if assignments:
+        return {"speaker_identity_mode": "full", "speaker_identity_notice": "Speaker identity assignments are available."}
+    return {"speaker_identity_mode": None, "speaker_identity_notice": None}
+
+
+def _cluster_status_label(assignment_source: str | None, speaker_identity_id: str | None) -> str:
+    if assignment_source == "user" and speaker_identity_id:
+        return "Confirmed"
+    if assignment_source == "auto" and speaker_identity_id:
+        return "Automatic"
+    if assignment_source == "suggested":
+        return "Suggested"
+    return "Unassigned"
+
+
+def _augment_segments_with_assignments(segments: list[dict], assignments: dict[str, dict]) -> list[dict]:
+    updated: list[dict] = []
+    for item in segments:
+        cluster_id = item.get("speaker_cluster_id") or item.get("speaker_label") or "speaker_1"
+        assignment = assignments.get(cluster_id, {})
+        profile_name = assignment.get("display_name")
+        updated.append(
+            {
+                **item,
+                "speaker_identity_id": assignment.get("speaker_identity_id"),
+                "speaker_display_name": profile_name or item.get("speaker_display_name") or item.get("speaker_label"),
+                "identity_confidence": assignment.get("match_score"),
+                "assignment_source": assignment.get("assignment_source"),
+            }
+        )
+    return updated
+
+
+def _call_queue_statuses(db, call_id: str) -> list[dict]:
+    rows = db.execute(
+        """
+        SELECT stage, status, started_at, finished_at, error_message
+        FROM queue_jobs
+        WHERE call_id = ?
+        ORDER BY available_at DESC
+        """,
+        (call_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _queue_counts(db) -> dict[str, int]:
+    counts = {"running": 0, "queued": 0, "failed": 0}
+    rows = db.execute(
+        """
+        SELECT status, COUNT(*) AS total
+        FROM queue_jobs
+        WHERE status IN ('running', 'queued', 'failed')
+        GROUP BY status
+        """
+    ).fetchall()
+    for row in rows:
+        counts[row["status"]] = int(row["total"])
+    return counts
+
+
+def _current_running_job(db) -> dict | None:
+    row = db.execute(
+        """
+        SELECT q.*, c.duration_seconds
+        FROM queue_jobs q
+        LEFT JOIN calls c ON c.call_id = q.call_id
+        WHERE q.status = 'running'
+        ORDER BY (q.started_at IS NULL), q.started_at ASC, q.available_at ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _completed_stage_runtime_samples(db, stage: str, limit: int = 20) -> list[dict]:
+    rows = db.execute(
+        """
+        SELECT q.call_id, c.duration_seconds, q.started_at, q.finished_at
+        FROM queue_jobs q
+        LEFT JOIN calls c ON c.call_id = q.call_id
+        WHERE q.stage = ?
+          AND q.status = 'done'
+          AND q.started_at IS NOT NULL
+          AND q.finished_at IS NOT NULL
+        ORDER BY q.finished_at DESC
+        LIMIT ?
+        """,
+        (stage, limit),
+    ).fetchall()
+    samples: list[dict] = []
+    for row in rows:
+        started_at = _parse_timestamp(row["started_at"])
+        finished_at = _parse_timestamp(row["finished_at"])
+        if not started_at or not finished_at:
+            continue
+        runtime_seconds = max(0.0, (finished_at - started_at).total_seconds())
+        samples.append(
+            {
+                "call_id": row["call_id"],
+                "duration_seconds": row["duration_seconds"],
+                "runtime_seconds": runtime_seconds,
+            }
+        )
+    return samples
+
+
+def _stage_default_runtime_seconds(stage: str, audio_duration_seconds: float | None) -> float:
+    if stage == "transcription" and audio_duration_seconds:
+        return max(60.0, audio_duration_seconds * 0.5)
+    if stage == "diarization" and audio_duration_seconds:
+        return max(120.0, audio_duration_seconds * 0.8)
+    return STAGE_DEFAULT_RUNTIME_SECONDS.get(stage, 60.0)
+
+
+def _estimate_stage_runtime_seconds(db, running_job: dict) -> float:
+    stage = running_job["stage"]
+    audio_duration_seconds = (
+        float(running_job["duration_seconds"])
+        if running_job.get("duration_seconds") is not None
+        else None
+    )
+    samples = _completed_stage_runtime_samples(db, stage)
+    if stage in {"transcription", "diarization"} and audio_duration_seconds:
+        ratios = [
+            sample["runtime_seconds"] / float(sample["duration_seconds"])
+            for sample in samples
+            if sample.get("duration_seconds")
+            and float(sample["duration_seconds"]) > 0
+        ]
+        median_ratio = _median(ratios)
+        if median_ratio is not None:
+            return max(1.0, audio_duration_seconds * median_ratio)
+    median_runtime = _median([sample["runtime_seconds"] for sample in samples])
+    if median_runtime is not None:
+        return max(1.0, median_runtime)
+    return _stage_default_runtime_seconds(stage, audio_duration_seconds)
+
+
+def _eta_recalc_window_seconds(estimated_total_seconds: float) -> float:
+    return max(ETA_RECALC_MIN_SECONDS, min(ETA_RECALC_MAX_SECONDS, estimated_total_seconds * 0.2))
+
+
+def _app_status_label(processing_mode_value: str, counts: dict[str, int]) -> str:
+    if counts["running"]:
+        return "Running"
+    if processing_mode_value == "manual_step" and counts["queued"]:
+        return "Paused"
+    if counts["failed"]:
+        return "Needs attention"
+    if counts["queued"]:
+        return "Backlog"
+    return "Idle"
+
+
+def _task_status_payload(db, running_job: dict | None) -> dict | None:
+    if not running_job:
+        return None
+    started_at = _parse_timestamp(running_job.get("started_at"))
+    elapsed_seconds: float | None = None
+    if started_at:
+        elapsed_seconds = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
+    estimated_total_seconds = _estimate_stage_runtime_seconds(db, running_job)
+    remaining_seconds: float | None = None
+    eta_status = "unknown"
+    estimated_finish_display = "unknown"
+    estimated_finish_at_iso = None
+    eta_extension_seconds: float | None = None
+    if started_at:
+        if elapsed_seconds is not None:
+            if elapsed_seconds <= estimated_total_seconds:
+                remaining_seconds = max(0.0, estimated_total_seconds - elapsed_seconds)
+                eta_status = "on_track"
+                estimated_finish_at = started_at + timedelta(seconds=estimated_total_seconds)
+                estimated_finish_at_iso = estimated_finish_at.isoformat()
+                estimated_finish_display = f"{_format_local_timestamp(estimated_finish_at_iso)} (about {_format_duration(remaining_seconds)} left)"
+            else:
+                eta_status = "recalculating"
+                eta_extension_seconds = _eta_recalc_window_seconds(estimated_total_seconds)
+                remaining_seconds = eta_extension_seconds
+                estimated_finish_at = datetime.now(timezone.utc) + timedelta(seconds=eta_extension_seconds)
+                estimated_finish_at_iso = estimated_finish_at.isoformat()
+                estimated_finish_display = f"{_format_local_timestamp(estimated_finish_at_iso)} (recalculating, about {_format_duration(remaining_seconds)} left)"
+        else:
+            estimated_finish_at = started_at + timedelta(seconds=estimated_total_seconds)
+            estimated_finish_at_iso = estimated_finish_at.isoformat()
+            estimated_finish_display = _format_local_timestamp(estimated_finish_at_iso)
+    return {
+        "call_id": running_job["call_id"],
+        "call_url": f"/calls/{running_job['call_id']}",
+        "stage": running_job["stage"],
+        "started_at": running_job.get("started_at"),
+        "started_at_display": _format_local_timestamp(running_job.get("started_at")),
+        "elapsed_seconds": elapsed_seconds,
+        "elapsed_display": _format_duration(elapsed_seconds),
+        "estimated_total_seconds": estimated_total_seconds,
+        "estimated_total_display": _format_duration(estimated_total_seconds),
+        "estimated_finish_at": estimated_finish_at_iso,
+        "estimated_finish_display": estimated_finish_display,
+        "remaining_seconds": remaining_seconds,
+        "remaining_display": _format_duration(remaining_seconds),
+        "eta_status": eta_status,
+        "eta_extension_seconds": eta_extension_seconds,
+    }
+
+
+def _app_status_payload(config: AppConfig, db) -> dict:
+    counts = _queue_counts(db)
+    mode = processing_mode(config)
+    running_job = _current_running_job(db)
+    return {
+        "server_now": utc_now(),
+        "app_status": _app_status_label(mode, counts),
+        "processing_mode": mode,
+        "counts": counts,
+        "current_task": _task_status_payload(db, running_job),
+        "poll_interval_seconds": STATUS_POLL_INTERVAL_SECONDS,
+    }
 
 
 def _refresh_transcript_outputs(call_dir: Path, config: AppConfig) -> list[dict]:
@@ -268,10 +545,11 @@ def _manual_processing_notice(config: AppConfig) -> str:
     return f"Imported {imported_count} new calls; completed {stage_count} stage(s) for call {call_id}."
 
 
-def _manual_processing_context(config: AppConfig, notice: str = "") -> dict[str, str]:
+def _shared_ui_context(config: AppConfig, db, notice: str = "") -> dict:
     return {
         "processing_mode": processing_mode(config),
         "notice": notice,
+        "status_line": _app_status_payload(config, db),
     }
 
 
@@ -290,6 +568,10 @@ def create_app(config: AppConfig) -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     def root(request: Request):
         return RedirectResponse(url="/calls")
+
+    @app.get("/ui/status-line")
+    def status_line():
+        return _app_status_payload(config, db)
 
     @app.get("/calls", response_class=HTMLResponse)
     def calls(
@@ -347,7 +629,7 @@ def create_app(config: AppConfig) -> FastAPI:
                 "sort_by": sort_by,
                 "sort_dir": sort_dir,
                 "sort_links": sort_links,
-                **_manual_processing_context(config, notice),
+                **_shared_ui_context(config, db, notice),
             },
         )
 
@@ -386,7 +668,10 @@ def create_app(config: AppConfig) -> FastAPI:
         retranscribe_choices = transcription_choices(config)
         retranscribe_language_choices = transcription_language_choices()
         metadata = read_json(call_dir / "metadata.json", default={})
-        segments = read_json(call_dir / "transcript_segments.json", default=[])
+        raw_segments = read_json(call_dir / "transcript_segments.json", default=[])
+        processing_log = read_json(call_dir / "processing_log.json", default=[])
+        assignment_by_cluster = call_speaker_assignments(db, call_id)
+        segments = _augment_segments_with_assignments(raw_segments, assignment_by_cluster)
         speaker_clusters = sorted(
             {
                 item.get("speaker_cluster_id") or item.get("speaker_label")
@@ -397,7 +682,10 @@ def create_app(config: AppConfig) -> FastAPI:
         selected_choice = f"{metadata.get('transcription_preference', {}).get('provider', 'local')}:{metadata.get('transcription_preference', {}).get('model', config.section('transcription')['local_model'])}"
         selected_language_override = metadata.get("transcription_language_override") or "auto"
         audio_path = _preferred_audio_path(call_dir)
-        speaker_profiles = list_speaker_profiles(db)
+        speaker_profiles = list_assignable_speaker_profiles(db)
+        diarization_context = _diarization_context(processing_log, segments)
+        speaker_identity_context = _speaker_identity_context(metadata, assignment_by_cluster)
+        queue_statuses = _call_queue_statuses(db, call_id)
         context = {
             "request": request,
             "call": call,
@@ -409,7 +697,7 @@ def create_app(config: AppConfig) -> FastAPI:
             "transcript_clean": (call_dir / "transcript_clean.txt").read_text(encoding="utf-8")
             if (call_dir / "transcript_clean.txt").exists()
             else "",
-            "processing_log": read_json(call_dir / "processing_log.json", default=[]),
+            "processing_log": processing_log,
             "retranscribe_choices": retranscribe_choices,
             "retranscribe_language_choices": retranscribe_language_choices,
             "selected_retranscribe_choice": selected_choice,
@@ -419,7 +707,12 @@ def create_app(config: AppConfig) -> FastAPI:
             "audio_url": f"/calls/{call_id}/audio" if audio_path else None,
             "segment_view": _segment_view(segments),
             "speaker_profiles": speaker_profiles,
-            **_manual_processing_context(config),
+            "assignment_by_cluster": assignment_by_cluster,
+            "cluster_status_label": _cluster_status_label,
+            "queue_statuses": queue_statuses,
+            **diarization_context,
+            **speaker_identity_context,
+            **_shared_ui_context(config, db),
         }
         return templates.TemplateResponse(request, "call_detail.html", context)
 
@@ -478,7 +771,7 @@ def create_app(config: AppConfig) -> FastAPI:
             "queue.html",
             {
                 "jobs": list_jobs(config),
-                **_manual_processing_context(config, notice),
+                **_shared_ui_context(config, db, notice),
             },
         )
 
@@ -546,7 +839,10 @@ def create_app(config: AppConfig) -> FastAPI:
         speaker_identity_id: str = Form(...),
     ):
         _, call_dir = _load_call(call_id)
-        assign_speaker_identity(config, call_dir, speaker_cluster_id, speaker_identity_id, assignment_source="user")
+        try:
+            assign_speaker_identity(config, call_dir, speaker_cluster_id, speaker_identity_id, assignment_source="user")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         _refresh_transcript_outputs(call_dir, config)
         append_log(
             call_dir / "processing_log.json",
@@ -569,7 +865,10 @@ def create_app(config: AppConfig) -> FastAPI:
             raise HTTPException(status_code=400, detail="Display name is required")
         _, call_dir = _load_call(call_id)
         speaker_identity_id = create_speaker_profile(db, display_name)
-        assign_speaker_identity(config, call_dir, speaker_cluster_id, speaker_identity_id, assignment_source="user")
+        try:
+            assign_speaker_identity(config, call_dir, speaker_cluster_id, speaker_identity_id, assignment_source="user")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         _refresh_transcript_outputs(call_dir, config)
         append_log(
             call_dir / "processing_log.json",
@@ -594,12 +893,49 @@ def create_app(config: AppConfig) -> FastAPI:
         )
         return RedirectResponse(url=f"/calls/{call_id}", status_code=303)
 
+    @app.post("/calls/{call_id}/speakers/accept-suggestion")
+    async def accept_speaker_suggestion(call_id: str, speaker_cluster_id: str = Form(...)):
+        _, call_dir = _load_call(call_id)
+        try:
+            speaker_identity_id = accept_suggested_speaker_identity(config, call_dir, speaker_cluster_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _refresh_transcript_outputs(call_dir, config)
+        append_log(
+            call_dir / "processing_log.json",
+            {
+                "event": "speaker_identity_suggestion_accepted",
+                "at": utc_now(),
+                "speaker_cluster_id": speaker_cluster_id,
+                "speaker_identity_id": speaker_identity_id,
+            },
+        )
+        return RedirectResponse(url=f"/calls/{call_id}", status_code=303)
+
+    @app.post("/calls/{call_id}/speakers/reject-suggestion")
+    async def reject_speaker_suggestion(call_id: str, speaker_cluster_id: str = Form(...)):
+        _, call_dir = _load_call(call_id)
+        try:
+            reject_suggested_speaker_identity(config, call_dir, speaker_cluster_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _refresh_transcript_outputs(call_dir, config)
+        append_log(
+            call_dir / "processing_log.json",
+            {
+                "event": "speaker_identity_suggestion_rejected",
+                "at": utc_now(),
+                "speaker_cluster_id": speaker_cluster_id,
+            },
+        )
+        return RedirectResponse(url=f"/calls/{call_id}", status_code=303)
+
     @app.get("/speakers", response_class=HTMLResponse)
     def speakers(request: Request):
         return templates.TemplateResponse(
             request,
             "speakers.html",
-            {"request": request, "profiles": list_speaker_profiles(db), **_manual_processing_context(config)},
+            {"request": request, "profiles": list_speaker_profiles(db), **_shared_ui_context(config, db)},
         )
 
     @app.get("/speakers/{speaker_identity_id}", response_class=HTMLResponse)
@@ -610,7 +946,20 @@ def create_app(config: AppConfig) -> FastAPI:
         return templates.TemplateResponse(
             request,
             "speaker_detail.html",
-            {"request": request, **detail, **_manual_processing_context(config)},
+            {"request": request, **detail, **_shared_ui_context(config, db)},
         )
+
+    @app.post("/speakers/{speaker_identity_id}/rename")
+    async def rename_speaker(request: Request, speaker_identity_id: str, display_name: str = Form(...)):
+        try:
+            rename_speaker_profile(db, speaker_identity_id, display_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return RedirectResponse(url=f"/speakers/{speaker_identity_id}", status_code=303)
+
+    @app.post("/speakers/{speaker_identity_id}/archive")
+    async def archive_speaker(request: Request, speaker_identity_id: str):
+        archive_speaker_profile(db, speaker_identity_id)
+        return RedirectResponse(url="/speakers", status_code=303)
 
     return app

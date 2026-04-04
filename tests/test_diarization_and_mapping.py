@@ -80,6 +80,26 @@ diarization:
         self.assertEqual(mapped[0]["speaker_cluster_id"], "speaker_1")
         self.assertEqual(mapped[0]["speaker_label"], "me")
 
+    def test_apply_speaker_mapping_accepts_transcript_segment_objects(self) -> None:
+        mapped = apply_speaker_mapping(
+            [
+                TranscriptSegment(
+                    segment_id="seg_0001",
+                    start_sec=0.0,
+                    end_sec=1.0,
+                    speaker_cluster_id="speaker_1",
+                    speaker_label="speaker_1",
+                    speaker_channel_label=None,
+                    text="Алло",
+                    confidence=None,
+                    diarization_confidence="medium",
+                )
+            ],
+            {"speaker_1": "me"},
+        )
+        self.assertEqual(mapped[0]["speaker_cluster_id"], "speaker_1")
+        self.assertEqual(mapped[0]["speaker_label"], "me")
+
     def test_clean_transcript_renders_cluster_labels(self) -> None:
         clean = clean_transcript(
             [

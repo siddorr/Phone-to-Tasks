@@ -15,17 +15,18 @@ if str(SRC) not in sys.path:
 
 from call_assistant.common.config import AppConfig
 from call_assistant.common.db import connect
-from call_assistant.common.io import write_json
+from call_assistant.common.io import read_json, write_json
+from call_assistant.common.models import TranscriptSegment
 from call_assistant.ingest.watcher import file_sha256
 from call_assistant.ingest.watcher import import_file
 from call_assistant.ingest.watcher import already_imported_source_path
 from call_assistant.indexing.service import index_call
 from call_assistant.orchestrator.queue import _stale_after_seconds_for_job, claim_next_job, claim_next_job_for_call, complete_job, enqueue, reset_running_jobs_on_startup
-from call_assistant.orchestrator.worker import WorkerThread, processing_mode
+from call_assistant.orchestrator.worker import WorkerThread, _process_diarization, _process_transcript_clean, _run_claimed_job, processing_mode
 from call_assistant.reprocess import reset_all_calls_for_retranscription
 from call_assistant.reprocess import reset_call_for_retranscription
 from call_assistant.transcription.service import _looks_mixed_language_problem, _transcribe_local, _transcription_preferences
-from call_assistant.ui.app import _compare_call_rows, _filter_calls_by_recent, _format_duration, _manual_processing_notice, _normalize_call_sort
+from call_assistant.ui.app import _app_status_payload, _compare_call_rows, _diarization_context, _estimate_stage_runtime_seconds, _filter_calls_by_recent, _format_duration, _manual_processing_notice, _normalize_call_sort
 
 
 class QueueTests(unittest.TestCase):
@@ -251,6 +252,193 @@ processing:
         self.assertIsNotNone(job)
         self.assertEqual(job.call_id, "call_b")
 
+    def test_app_status_payload_idle_when_no_jobs_exist(self) -> None:
+        db = connect(self.config.sqlite_path)
+        payload = _app_status_payload(self.config, db)
+        self.assertEqual(payload["app_status"], "Idle")
+        self.assertEqual(payload["counts"], {"running": 0, "queued": 0, "failed": 0})
+        self.assertIn("server_now", payload)
+        self.assertIsNone(payload["current_task"])
+
+    def test_app_status_payload_paused_in_manual_mode_with_queued_jobs(self) -> None:
+        enqueue(self.config, "call_queued", "audio_prepare")
+        db = connect(self.config.sqlite_path)
+        payload = _app_status_payload(self.config, db)
+        self.assertEqual(payload["app_status"], "Paused")
+        self.assertEqual(payload["counts"]["queued"], 1)
+
+    def test_app_status_payload_uses_oldest_running_job(self) -> None:
+        db = connect(self.config.sqlite_path)
+        db.execute(
+            """
+            INSERT INTO calls (
+                call_id, archive_path, source_filename, source_path, sha256, imported_at,
+                current_state, review_state, low_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "call_old",
+                str(self.config.archive_root / "call_old"),
+                "old.wav",
+                "old.wav",
+                "sha_old",
+                "2026-01-01T00:00:00+00:00",
+                "diarizing",
+                "pending",
+                0,
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO calls (
+                call_id, archive_path, source_filename, source_path, sha256, imported_at,
+                current_state, review_state, low_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "call_new",
+                str(self.config.archive_root / "call_new"),
+                "new.wav",
+                "new.wav",
+                "sha_new",
+                "2026-01-01T00:00:01+00:00",
+                "diarizing",
+                "pending",
+                0,
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO queue_jobs (
+                job_id, call_id, stage, status, priority, attempt_count, max_attempts, available_at, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("job_new", "call_new", "diarization", "running", 0, 1, 2, "2026-01-01T00:00:02+00:00", "2026-01-01T00:00:20+00:00"),
+        )
+        db.execute(
+            """
+            INSERT INTO queue_jobs (
+                job_id, call_id, stage, status, priority, attempt_count, max_attempts, available_at, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("job_old", "call_old", "analysis", "running", 0, 1, 2, "2026-01-01T00:00:03+00:00", "2026-01-01T00:00:10+00:00"),
+        )
+        db.commit()
+
+        payload = _app_status_payload(self.config, db)
+        self.assertEqual(payload["app_status"], "Running")
+        self.assertEqual(payload["current_task"]["call_id"], "call_old")
+        self.assertEqual(payload["current_task"]["stage"], "analysis")
+        self.assertIn("started_at", payload["current_task"])
+        self.assertIn("estimated_finish_at", payload["current_task"])
+        self.assertIn("elapsed_seconds", payload["current_task"])
+        self.assertIn("remaining_seconds", payload["current_task"])
+
+    def test_estimate_stage_runtime_seconds_uses_stage_default_without_history(self) -> None:
+        db = connect(self.config.sqlite_path)
+        running_job = {"stage": "analysis", "duration_seconds": None}
+        self.assertEqual(_estimate_stage_runtime_seconds(db, running_job), 45.0)
+
+    def test_estimate_stage_runtime_seconds_uses_audio_ratio_for_diarization(self) -> None:
+        db = connect(self.config.sqlite_path)
+        db.execute(
+            """
+            INSERT INTO calls (
+                call_id, archive_path, source_filename, source_path, sha256, imported_at,
+                duration_seconds, current_state, review_state, low_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "call_hist",
+                str(self.config.archive_root / "call_hist"),
+                "hist.wav",
+                "hist.wav",
+                "sha_hist",
+                "2026-01-01T00:00:00+00:00",
+                100.0,
+                "diarized",
+                "pending",
+                0,
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO queue_jobs (
+                job_id, call_id, stage, status, priority, attempt_count, max_attempts, available_at, started_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "job_hist",
+                "call_hist",
+                "diarization",
+                "done",
+                0,
+                1,
+                2,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:02:30+00:00",
+            ),
+        )
+        db.commit()
+
+        estimate = _estimate_stage_runtime_seconds(db, {"stage": "diarization", "duration_seconds": 200.0})
+        self.assertEqual(estimate, 300.0)
+
+    def test_app_status_payload_recalculates_eta_after_estimate_is_exceeded(self) -> None:
+        db = connect(self.config.sqlite_path)
+        db.execute(
+            """
+            INSERT INTO calls (
+                call_id, archive_path, source_filename, source_path, sha256, imported_at,
+                current_state, review_state, low_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "call_recalc",
+                str(self.config.archive_root / "call_recalc"),
+                "recalc.wav",
+                "recalc.wav",
+                "sha_recalc",
+                "2026-01-01T00:00:00+00:00",
+                "analyzing",
+                "pending",
+                0,
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO queue_jobs (
+                job_id, call_id, stage, status, priority, attempt_count, max_attempts, available_at, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "job_recalc",
+                "call_recalc",
+                "analysis",
+                "running",
+                0,
+                1,
+                2,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        db.commit()
+
+        payload = _app_status_payload(self.config, db)
+        self.assertEqual(payload["current_task"]["eta_status"], "recalculating")
+        self.assertIsNotNone(payload["current_task"]["eta_extension_seconds"])
+        self.assertIn("recalculating", payload["current_task"]["estimated_finish_display"])
+
+    def test_diarization_context_detects_single_speaker_fallback(self) -> None:
+        context = _diarization_context(
+            [{"event": "fallback_diarization_completed", "mode": "single_speaker"}],
+            [{"speaker_cluster_id": "speaker_1"}],
+        )
+        self.assertEqual(context["diarization_mode"], "single_speaker_fallback")
+        self.assertIn("single-speaker fallback", context["diarization_notice"])
+
     def test_index_call_updates_existing_imported_row_state(self) -> None:
         sample = self.config.incoming_folder / "sample.wav"
         sample.write_bytes(b"abc")
@@ -291,6 +479,212 @@ processing:
         self.assertEqual(row["current_state"], "transcribed")
         self.assertEqual(row["audio_format"], "wav")
         self.assertEqual(row["duration_seconds"], 1.5)
+
+    def test_process_transcript_clean_writes_clean_transcript_and_updates_state(self) -> None:
+        sample = self.config.incoming_folder / "sample.wav"
+        sample.write_bytes(b"abc")
+
+        call_id = import_file(sample, self.config)
+        self.assertIsNotNone(call_id)
+
+        db = connect(self.config.sqlite_path)
+        archive_path = Path(
+            db.execute("SELECT archive_path FROM calls WHERE call_id = ?", (call_id,)).fetchone()["archive_path"]
+        )
+        call_row = db.execute(
+            "SELECT source_filename, source_path, sha256, imported_at FROM calls WHERE call_id = ?",
+            (call_id,),
+        ).fetchone()
+        write_json(
+            archive_path / "metadata.json",
+            {
+                "call_id": call_id,
+                "source_filename": call_row["source_filename"],
+                "source_path": call_row["source_path"],
+                "sha256": call_row["sha256"],
+                "imported_at": call_row["imported_at"],
+                "current_state": "speaker_identity",
+                "review_state": "pending",
+                "errors": [],
+            },
+        )
+        write_json(
+            archive_path / "transcript_segments.json",
+            [
+                {
+                    "segment_id": "seg_1",
+                    "start_sec": 0.0,
+                    "end_sec": 1.0,
+                    "speaker_cluster_id": "speaker_1",
+                    "speaker_label": "speaker_1",
+                    "speaker_channel_label": None,
+                    "text": "Hello   there!!!",
+                    "confidence": None,
+                    "speaker_display_name": None,
+                    "speaker_identity_id": None,
+                    "identity_confidence": None,
+                    "diarization_confidence": None,
+                }
+            ],
+        )
+
+        _process_transcript_clean(self.config, archive_path)
+
+        self.assertTrue((archive_path / "transcript_clean.txt").exists())
+        row = db.execute("SELECT current_state FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+        self.assertEqual(row["current_state"], "transcript_clean")
+
+    def test_process_diarization_accepts_transcript_segment_objects(self) -> None:
+        sample = self.config.incoming_folder / "sample.wav"
+        sample.write_bytes(b"abc")
+
+        call_id = import_file(sample, self.config)
+        self.assertIsNotNone(call_id)
+
+        db = connect(self.config.sqlite_path)
+        archive_path = Path(
+            db.execute("SELECT archive_path FROM calls WHERE call_id = ?", (call_id,)).fetchone()["archive_path"]
+        )
+        call_row = db.execute(
+            "SELECT source_filename, source_path, sha256, imported_at FROM calls WHERE call_id = ?",
+            (call_id,),
+        ).fetchone()
+        write_json(
+            archive_path / "metadata.json",
+            {
+                "call_id": call_id,
+                "source_filename": call_row["source_filename"],
+                "source_path": call_row["source_path"],
+                "sha256": call_row["sha256"],
+                "imported_at": call_row["imported_at"],
+                "current_state": "transcribed",
+                "review_state": "pending",
+                "errors": [],
+            },
+        )
+        write_json(
+            archive_path / "transcript_raw.json",
+            {
+                "provider": "test",
+                "model": "test",
+                "language": "en",
+                "confidence": 1.0,
+                "text": "Hello",
+                "segments": [{"start_sec": 0.0, "end_sec": 1.0, "text": "Hello"}],
+            },
+        )
+
+        segments = [
+            TranscriptSegment(
+                segment_id="seg_1",
+                start_sec=0.0,
+                end_sec=1.0,
+                speaker_cluster_id="speaker_1",
+                speaker_label="speaker_1",
+                speaker_channel_label=None,
+                text="Hello",
+                confidence=None,
+                diarization_confidence="medium",
+            )
+        ]
+        with patch("call_assistant.orchestrator.worker.transcribe_data_to_segments", return_value=segments):
+            _process_diarization(self.config, archive_path)
+
+        metadata = read_json(archive_path / "metadata.json", default={})
+        self.assertEqual(metadata.get("current_state"), "diarized")
+        self.assertEqual(metadata.get("diarization_mode"), "single_speaker_fallback")
+        self.assertEqual(metadata.get("stage_outcomes", {}).get("diarization", {}).get("status"), "degraded")
+
+    def test_run_claimed_job_clears_stale_errors_after_success(self) -> None:
+        sample = self.config.incoming_folder / "sample.wav"
+        sample.write_bytes(b"abc")
+
+        call_id = import_file(sample, self.config)
+        self.assertIsNotNone(call_id)
+
+        db = connect(self.config.sqlite_path)
+        archive_path = Path(
+            db.execute("SELECT archive_path FROM calls WHERE call_id = ?", (call_id,)).fetchone()["archive_path"]
+        )
+        metadata = read_json(archive_path / "metadata.json", default={})
+        metadata["current_state"] = "failed"
+        metadata["errors"] = ["old failure"]
+        write_json(archive_path / "metadata.json", metadata)
+        db.execute("UPDATE calls SET current_state = 'failed', last_error = 'old failure' WHERE call_id = ?", (call_id,))
+        db.commit()
+
+        job = types.SimpleNamespace(job_id="job_1", call_id=call_id, stage="transcript_clean", attempt_count=1)
+
+        with patch("call_assistant.orchestrator.worker.process_job") as process_mock:
+            with patch("call_assistant.orchestrator.worker.complete_job") as complete_mock:
+                result = _run_claimed_job(self.config, job)
+
+        self.assertTrue(result)
+        process_mock.assert_called_once_with(self.config, job)
+        complete_mock.assert_called_once_with(self.config, "job_1")
+
+        metadata = read_json(archive_path / "metadata.json", default={})
+        self.assertEqual(metadata.get("errors"), [])
+        row = db.execute("SELECT last_error FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+        self.assertIsNone(row["last_error"])
+
+    def test_run_claimed_job_retryable_failure_preserves_last_stable_state(self) -> None:
+        sample = self.config.incoming_folder / "sample.wav"
+        sample.write_bytes(b"abc")
+
+        call_id = import_file(sample, self.config)
+        self.assertIsNotNone(call_id)
+
+        db = connect(self.config.sqlite_path)
+        archive_path = Path(
+            db.execute("SELECT archive_path FROM calls WHERE call_id = ?", (call_id,)).fetchone()["archive_path"]
+        )
+        metadata = read_json(archive_path / "metadata.json", default={})
+        metadata["current_state"] = "transcribing"
+        write_json(archive_path / "metadata.json", metadata)
+        db.execute("UPDATE calls SET current_state = 'transcribing' WHERE call_id = ?", (call_id,))
+        db.commit()
+
+        job = types.SimpleNamespace(job_id="job_retry", call_id=call_id, stage="transcription", attempt_count=1, max_attempts=3)
+
+        with patch("call_assistant.orchestrator.worker.process_job", side_effect=RuntimeError("boom")):
+            result = _run_claimed_job(self.config, job)
+
+        self.assertTrue(result)
+        metadata = read_json(archive_path / "metadata.json", default={})
+        self.assertEqual(metadata.get("current_state"), "audio_prepared")
+        self.assertEqual(metadata.get("last_blocking_stage"), "transcription")
+        self.assertEqual(metadata.get("last_blocking_error"), "boom")
+        self.assertEqual(metadata.get("stage_outcomes", {}).get("transcription", {}).get("status"), "failed_retryable")
+
+    def test_run_claimed_job_terminal_failure_marks_call_failed(self) -> None:
+        sample = self.config.incoming_folder / "sample.wav"
+        sample.write_bytes(b"abc")
+
+        call_id = import_file(sample, self.config)
+        self.assertIsNotNone(call_id)
+
+        db = connect(self.config.sqlite_path)
+        archive_path = Path(
+            db.execute("SELECT archive_path FROM calls WHERE call_id = ?", (call_id,)).fetchone()["archive_path"]
+        )
+        metadata = read_json(archive_path / "metadata.json", default={})
+        metadata["current_state"] = "analyzing"
+        write_json(archive_path / "metadata.json", metadata)
+        db.execute("UPDATE calls SET current_state = 'analyzing' WHERE call_id = ?", (call_id,))
+        db.commit()
+
+        job = types.SimpleNamespace(job_id="job_fail", call_id=call_id, stage="analysis", attempt_count=3, max_attempts=3)
+
+        with patch("call_assistant.orchestrator.worker.process_job", side_effect=RuntimeError("kaput")):
+            result = _run_claimed_job(self.config, job)
+
+        self.assertTrue(result)
+        metadata = read_json(archive_path / "metadata.json", default={})
+        self.assertEqual(metadata.get("current_state"), "failed")
+        self.assertEqual(metadata.get("last_blocking_stage"), "analysis")
+        self.assertEqual(metadata.get("last_blocking_error"), "kaput")
+        self.assertEqual(metadata.get("stage_outcomes", {}).get("analysis", {}).get("status"), "failed_terminal")
 
     def test_index_call_handles_duplicate_task_ids_within_call(self) -> None:
         sample = self.config.incoming_folder / "sample.wav"
