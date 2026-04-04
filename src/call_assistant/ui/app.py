@@ -259,12 +259,19 @@ def _calls_sort_link(
     return f"/calls?{query_string}" if query_string else "/calls"
 
 
-def _queue_manual_process_notice(config: AppConfig) -> str:
+def _manual_processing_notice(config: AppConfig) -> str:
     if processing_mode(config) != "manual_step":
         return "Manual processing is disabled in automatic mode."
     imported_count, processed = run_manual_step(config)
     job_notice = "processed 1 job" if processed else "no queued job was available"
     return f"Imported {imported_count} new calls; {job_notice}."
+
+
+def _manual_processing_context(config: AppConfig, notice: str = "") -> dict[str, str]:
+    return {
+        "processing_mode": processing_mode(config),
+        "notice": notice,
+    }
 
 
 def create_app(config: AppConfig) -> FastAPI:
@@ -339,7 +346,7 @@ def create_app(config: AppConfig) -> FastAPI:
                 "sort_by": sort_by,
                 "sort_dir": sort_dir,
                 "sort_links": sort_links,
-                "notice": notice,
+                **_manual_processing_context(config, notice),
             },
         )
 
@@ -411,6 +418,7 @@ def create_app(config: AppConfig) -> FastAPI:
             "audio_url": f"/calls/{call_id}/audio" if audio_path else None,
             "segment_view": _segment_view(segments),
             "speaker_profiles": speaker_profiles,
+            **_manual_processing_context(config),
         }
         return templates.TemplateResponse(request, "call_detail.html", context)
 
@@ -469,14 +477,13 @@ def create_app(config: AppConfig) -> FastAPI:
             "queue.html",
             {
                 "jobs": list_jobs(config),
-                "processing_mode": processing_mode(config),
-                "notice": notice,
+                **_manual_processing_context(config, notice),
             },
         )
 
     @app.post("/queue/process-next")
     def process_next_queue_job():
-        notice = _queue_manual_process_notice(config)
+        notice = _manual_processing_notice(config)
         return RedirectResponse(url=f"/queue?notice={notice}", status_code=303)
 
     @app.post("/queue/retry/{job_id}")
@@ -588,13 +595,21 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @app.get("/speakers", response_class=HTMLResponse)
     def speakers(request: Request):
-        return templates.TemplateResponse(request, "speakers.html", {"profiles": list_speaker_profiles(db)})
+        return templates.TemplateResponse(
+            request,
+            "speakers.html",
+            {"request": request, "profiles": list_speaker_profiles(db), **_manual_processing_context(config)},
+        )
 
     @app.get("/speakers/{speaker_identity_id}", response_class=HTMLResponse)
     def speaker_detail(request: Request, speaker_identity_id: str):
         detail = speaker_profile_detail(db, speaker_identity_id)
         if not detail:
             raise HTTPException(status_code=404, detail="Speaker profile not found")
-        return templates.TemplateResponse(request, "speaker_detail.html", {"request": request, **detail})
+        return templates.TemplateResponse(
+            request,
+            "speaker_detail.html",
+            {"request": request, **detail, **_manual_processing_context(config)},
+        )
 
     return app

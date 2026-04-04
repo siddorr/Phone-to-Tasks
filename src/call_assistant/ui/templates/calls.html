@@ -15,6 +15,7 @@
       input, button, select { padding: 0.55rem; }
       th a { color: inherit; display: inline-flex; gap: 0.35rem; align-items: center; }
       .muted-link { color: #6d6d64; }
+      .mode { padding: 0.8rem 1rem; background: #fff; border: 1px solid #ddd4c7; margin-bottom: 1rem; display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
     </style>
   </head>
   <body>
@@ -23,6 +24,15 @@
     {% if notice %}
     <div class="notice">{{ notice }}</div>
     {% endif %}
+    <div class="mode">
+      <strong>Processing mode:</strong>
+      <span class="badge">{{ processing_mode }}</span>
+      {% if processing_mode == 'manual_step' %}
+      <form method="post" action="/queue/process-next">
+        <button type="submit">Scan + Process One Job</button>
+      </form>
+      {% endif %}
+    </div>
     <form method="post" action="/upload-audio" enctype="multipart/form-data" class="upload-form">
       <input type="file" name="audio_file" accept=".wav,.mp3,.m4a,.aac,.flac,.ogg,.wma" required>
       <button type="submit">Upload Audio</button>

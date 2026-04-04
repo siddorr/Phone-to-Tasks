@@ -25,7 +25,7 @@ from call_assistant.orchestrator.worker import WorkerThread, processing_mode
 from call_assistant.reprocess import reset_all_calls_for_retranscription
 from call_assistant.reprocess import reset_call_for_retranscription
 from call_assistant.transcription.service import _looks_mixed_language_problem, _transcribe_local, _transcription_preferences
-from call_assistant.ui.app import _compare_call_rows, _filter_calls_by_recent, _format_duration, _normalize_call_sort, _queue_manual_process_notice
+from call_assistant.ui.app import _compare_call_rows, _filter_calls_by_recent, _format_duration, _manual_processing_notice, _normalize_call_sort
 
 
 class QueueTests(unittest.TestCase):
@@ -231,14 +231,14 @@ processing:
 
     def test_queue_manual_process_notice_runs_manual_step(self) -> None:
         with patch("call_assistant.ui.app.run_manual_step", return_value=(2, True)) as run_step:
-            notice = _queue_manual_process_notice(self.config)
+            notice = _manual_processing_notice(self.config)
         self.assertEqual(notice, "Imported 2 new calls; processed 1 job.")
         run_step.assert_called_once_with(self.config)
 
     def test_queue_manual_process_notice_rejects_automatic_mode(self) -> None:
         self.config.data["processing"]["startup_mode"] = "automatic"
         with patch("call_assistant.ui.app.run_manual_step") as run_step:
-            notice = _queue_manual_process_notice(self.config)
+            notice = _manual_processing_notice(self.config)
         self.assertEqual(notice, "Manual processing is disabled in automatic mode.")
         run_step.assert_not_called()
 
