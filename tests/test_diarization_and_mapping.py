@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import sys
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -13,7 +14,7 @@ if str(SRC) not in sys.path:
 from call_assistant.common.config import AppConfig
 from call_assistant.common.models import RawSegment, RawTranscript, TranscriptSegment
 from call_assistant.analysis.service import _fallback_analysis
-from call_assistant.diarization.service import apply_speaker_mapping, diarize
+from call_assistant.diarization.service import SpeakerTurn, apply_speaker_mapping, diarize
 from call_assistant.transcript_cleaner.service import clean_transcript
 
 
@@ -59,6 +60,49 @@ diarization:
         self.assertEqual(result[0].speaker_cluster_id, "speaker_1")
         self.assertEqual(result[0].speaker_label, "speaker_1")
         self.assertEqual(result[0].diarization_confidence, "low")
+
+    def test_diarize_prefers_largest_overlap_not_midpoint_only(self) -> None:
+        raw = RawTranscript(
+            provider="local",
+            model="test",
+            language="ru",
+            confidence=None,
+            text="Привет да",
+            segments=[RawSegment(start_sec=0.0, end_sec=10.0, text="Привет да")],
+        )
+        audio_path = Path(self.temp_dir.name) / "dummy.wav"
+        audio_path.write_bytes(b"dummy")
+        turns = [
+            SpeakerTurn(start_sec=0.0, end_sec=6.1, speaker_cluster_id="speaker_1", confidence="medium"),
+            SpeakerTurn(start_sec=6.1, end_sec=10.0, speaker_cluster_id="speaker_2", confidence="medium"),
+        ]
+        with mock.patch("call_assistant.diarization.service._run_pyannote", return_value=turns):
+            result = diarize(raw, self.config, audio_path=audio_path)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].speaker_cluster_id, "speaker_1")
+
+    def test_diarize_splits_segment_when_multiple_turns_overlap_and_text_has_sentences(self) -> None:
+        raw = RawTranscript(
+            provider="local",
+            model="test",
+            language="he",
+            confidence=None,
+            text="הלו. שלום זה שליר. שלום.",
+            segments=[RawSegment(start_sec=0.0, end_sec=5.0, text="הלו. שלום זה שליר. שלום.")],
+        )
+        audio_path = Path(self.temp_dir.name) / "dummy_split.wav"
+        audio_path.write_bytes(b"dummy")
+        turns = [
+            SpeakerTurn(start_sec=0.0, end_sec=1.5, speaker_cluster_id="speaker_1", confidence="medium"),
+            SpeakerTurn(start_sec=1.5, end_sec=5.0, speaker_cluster_id="speaker_2", confidence="medium"),
+        ]
+        with mock.patch("call_assistant.diarization.service._run_pyannote", return_value=turns):
+            result = diarize(raw, self.config, audio_path=audio_path)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].speaker_cluster_id, "speaker_1")
+        self.assertEqual(result[0].text, "הלו.")
+        self.assertEqual(result[1].speaker_cluster_id, "speaker_2")
+        self.assertEqual(result[1].text, "שלום זה שליר. שלום.")
 
     def test_apply_speaker_mapping_preserves_cluster_id(self) -> None:
         mapped = apply_speaker_mapping(

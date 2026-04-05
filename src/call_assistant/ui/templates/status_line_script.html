@@ -52,6 +52,28 @@
     return `${formatLocalTimestamp(estimatedFinishAt)} (about ${formatDuration(remainingSeconds)} left)`;
   };
 
+  const formatProgress = (progressPercent) => {
+    if (progressPercent == null || !Number.isFinite(progressPercent)) return "-";
+    return `${progressPercent.toFixed(1)}%`;
+  };
+
+  const formatStepName = (stepName) => {
+    if (!stepName) return "-";
+    return String(stepName).replace(/_/g, " ");
+  };
+
+  const recalcWindowSeconds = (referenceSeconds) => {
+    const safeReference = Number.isFinite(referenceSeconds) ? referenceSeconds : 0;
+    return Math.max(15, Math.min(300, safeReference * 0.2));
+  };
+
+  const recalculatedRemainingSeconds = (estimatedTotalSeconds, elapsedSeconds) => {
+    const safeEstimated = Number.isFinite(estimatedTotalSeconds) ? estimatedTotalSeconds : 0;
+    const safeElapsed = Number.isFinite(elapsedSeconds) ? elapsedSeconds : 0;
+    const referenceSeconds = Math.max(safeEstimated, safeElapsed);
+    return recalcWindowSeconds(referenceSeconds);
+  };
+
   const updateLiveNote = () => {
     const isDelayed = !lastSuccessAtMs || (Date.now() - lastSuccessAtMs > staleAfterMs) || lastFailureCount >= 3;
     setVisible("status-live-note-group", isDelayed);
@@ -72,6 +94,8 @@
       setVisible("status-current-call-group", false);
       setVisible("status-started-group", false);
       setVisible("status-elapsed-group", false);
+      setVisible("status-progress-group", false);
+      setVisible("status-substage-group", false);
       setVisible("status-eta-group", false);
       updateLiveNote();
       return;
@@ -85,10 +109,14 @@
     }
     setText("status-started-at", task.started_at_display);
     setText("status-elapsed", task.elapsed_display);
+    setText("status-progress", formatProgress(Number(task.progress_percent)));
+    setText("status-substage", formatStepName(task.progress_step_display));
     setText("status-eta", task.estimated_finish_display);
     setVisible("status-current-call-group", true);
     setVisible("status-started-group", true);
     setVisible("status-elapsed-group", true);
+    setVisible("status-progress-group", true);
+    setVisible("status-substage-group", true);
     setVisible("status-eta-group", true);
     updateLiveNote();
   };
@@ -114,15 +142,30 @@
     const elapsedSeconds = Math.max(0, Math.round((now.getTime() - startedAt.getTime()) / 1000));
     setText("status-elapsed", formatDuration(elapsedSeconds));
 
+    const progressCompleted = Number(task.progress_completed);
+    const progressTotal = Number(task.progress_total);
+    const hasProgress = Number.isFinite(progressCompleted) && Number.isFinite(progressTotal) && progressTotal > 0;
+    let progressPercent = Number(task.progress_percent);
+    if (hasProgress) {
+      progressPercent = Math.max(0, Math.min(100, (progressCompleted / progressTotal) * 100));
+      setText("status-progress", formatProgress(progressPercent));
+    }
+    setText("status-substage", formatStepName(task.progress_step_display));
+
     if (task.estimated_finish_at) {
       let estimatedFinishAt = task.estimated_finish_at;
       let remainingSeconds;
       let etaStatus = task.eta_status;
 
-      if (etaStatus === "recalculating") {
-        const extensionSeconds = Number(task.eta_extension_seconds || 15);
-        remainingSeconds = extensionSeconds;
-        estimatedFinishAt = new Date(now.getTime() + extensionSeconds * 1000).toISOString();
+      if (hasProgress && progressCompleted > 0 && progressCompleted < progressTotal) {
+        const progressFraction = progressCompleted / progressTotal;
+        const estimatedTotalSeconds = elapsedSeconds / progressFraction;
+        remainingSeconds = Math.max(0, Math.round(estimatedTotalSeconds - elapsedSeconds));
+        estimatedFinishAt = new Date(now.getTime() + remainingSeconds * 1000).toISOString();
+        etaStatus = "progress";
+      } else if (etaStatus === "recalculating") {
+        remainingSeconds = recalculatedRemainingSeconds(Number(task.estimated_total_seconds), elapsedSeconds);
+        estimatedFinishAt = new Date(now.getTime() + remainingSeconds * 1000).toISOString();
       } else {
         const etaDate = new Date(task.estimated_finish_at);
         if (!Number.isNaN(etaDate.getTime())) {

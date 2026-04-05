@@ -41,11 +41,25 @@
       </div>
     </div>
     <div class="status-line__actions" id="status-manual-button-container">
-      {% if status_line.processing_mode == 'manual_step' %}
-      <form method="post" action="/queue/process-next">
-        <button type="submit">Scan + Process Current Call</button>
-      </form>
-      {% endif %}
+      <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+        <form method="post" action="/processing-mode">
+          <input type="hidden" name="mode" value="{{ 'automatic' if status_line.processing_mode == 'manual_step' else 'manual_step' }}">
+          <button type="submit">
+            Switch to {{ 'automatic' if status_line.processing_mode == 'manual_step' else 'manual_step' }}
+          </button>
+        </form>
+        <form method="post" action="/queue/clear">
+          <button type="submit">Empty Queue</button>
+        </form>
+        {% if status_line.processing_mode == 'manual_step' %}
+        <form method="post" action="/queue/process-next">
+          <button type="submit">Process Next Call</button>
+        </form>
+        <form method="post" action="/queue/scan-incoming">
+          <button type="submit">Scan Incoming</button>
+        </form>
+        {% endif %}
+      </div>
     </div>
   </div>
   <div class="status-line__task" id="status-current-task-container">
@@ -64,6 +78,14 @@
     <div class="status-line__group" id="status-elapsed-group" {% if not status_line.current_task %}style="display: none;"{% endif %}>
       <span class="status-line__label">Elapsed</span>
       <strong id="status-elapsed">{{ status_line.current_task.elapsed_display if status_line.current_task else '-' }}</strong>
+    </div>
+    <div class="status-line__group" id="status-progress-group" {% if not status_line.current_task %}style="display: none;"{% endif %}>
+      <span class="status-line__label">Progress</span>
+      <strong id="status-progress">{{ (status_line.current_task.progress_percent ~ '%') if status_line.current_task and status_line.current_task.progress_percent is not none else '-' }}</strong>
+    </div>
+    <div class="status-line__group" id="status-substage-group" {% if not status_line.current_task %}style="display: none;"{% endif %}>
+      <span class="status-line__label">Step</span>
+      <strong id="status-substage">{{ status_line.current_task.progress_step_display if status_line.current_task and status_line.current_task.progress_step_display else '-' }}</strong>
     </div>
     <div class="status-line__group" id="status-eta-group" {% if not status_line.current_task %}style="display: none;"{% endif %}>
       <span class="status-line__label">ETA finish</span>

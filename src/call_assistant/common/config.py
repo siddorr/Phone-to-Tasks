@@ -54,6 +54,41 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "language_mode": "auto",
         "force_language_for_single_language_calls": False,
         "mixed_language_triggers": ["he", "ru"],
+        "quality_retry_enabled": True,
+        "retry_languages_on_suspicion": ["he"],
+        "suspicious_short_call_seconds": 20,
+        "suspicious_medium_call_seconds": 30,
+        "candidate_merge_enabled": True,
+    },
+    "segment_detection": {
+        "enabled": True,
+        "provider": "openai",
+        "model": "gpt-4.1-mini",
+        "run_on_every_call": True,
+        "timeout_sec": 45,
+        "max_retries": 2,
+        "max_segments_per_call": 200,
+        "context_window_segments": 2,
+        "max_retry_segments_per_call": 10,
+        "retry_language": "he",
+        "min_confidence_to_retry": 0.0,
+        "continue_on_error": True,
+        "extraction_mode": "word_span",
+        "max_candidate_spans_per_segment": 12,
+        "min_span_words": 1,
+        "max_span_words": 3,
+        "audio_span_padding_sec": 0.35,
+        "semantic_validation_enabled": True,
+        "semantic_validation_model": "gpt-4.1-mini",
+        "semantic_validation_timeout_sec": 45,
+        "semantic_min_confidence_to_accept": 0.75,
+        "segment_reconciliation_enabled": True,
+        "segment_reconciliation_model": "gpt-4.1-mini",
+        "clause_retry_enabled": True,
+        "clause_retry_min_span_words": 4,
+        "clause_retry_max_span_words": 8,
+        "clause_retry_audio_padding_sec": 0.65,
+        "clause_retry_max_per_call": 6,
     },
     "diarization": {
         "provider": "pyannote",
@@ -153,3 +188,13 @@ class AppConfig:
             self.temp_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
+
+    def save(self, config_path: str | Path | None = None) -> Path:
+        path = Path(config_path) if config_path is not None else (self.root_dir / "config.yaml")
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(self.data, handle, sort_keys=False, allow_unicode=True)
+        self.root_dir = path.parent
+        return path

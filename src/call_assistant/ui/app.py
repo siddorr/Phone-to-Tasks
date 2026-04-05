@@ -4,8 +4,10 @@ from datetime import datetime, timedelta, timezone
 from functools import cmp_to_key
 import logging
 import shutil
+import threading
+import time
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -16,10 +18,11 @@ from call_assistant.common.db import connect
 from call_assistant.common.io import append_log, read_json, write_json
 from call_assistant.common.models import TranscriptSegment
 from call_assistant.common.models import utc_now
+from call_assistant.common.progress import get_stage_progress
 from call_assistant.diarization.service import apply_speaker_mapping
-from call_assistant.ingest.watcher import import_file
+from call_assistant.ingest.watcher import detect_new_calls, import_file
 from call_assistant.indexing.service import index_call
-from call_assistant.orchestrator.queue import enqueue, list_jobs
+from call_assistant.orchestrator.queue import enqueue, is_job_stale, list_jobs
 from call_assistant.orchestrator.worker import processing_mode, run_manual_step
 from call_assistant.reprocess import reset_call_for_retranscription, transcription_choices
 from call_assistant.reprocess import transcription_language_choices
@@ -40,6 +43,8 @@ from call_assistant.speaker_identity.service import (
 from call_assistant.transcript_cleaner.service import clean_transcript
 
 logger = logging.getLogger(__name__)
+STATUS_LINE_LOG_INTERVAL_SECONDS = 15.0
+_LAST_STATUS_LINE_LOG: dict[str, object] = {"signature": None, "at": 0.0}
 
 DEFAULT_CALL_SORT_BY = "recorded_at"
 DEFAULT_CALL_SORT_DIRECTIONS = {
@@ -69,6 +74,15 @@ STAGE_DEFAULT_RUNTIME_SECONDS = {
     "transcript_clean": 15.0,
     "analysis": 45.0,
     "indexing": 15.0,
+}
+PROGRESS_STEP_LABELS = {
+    "loading_model": "loading model",
+    "model_loaded": "model ready",
+    "model_cached": "reusing model",
+    "preparing_audio": "preparing audio",
+    "detecting_language": "detecting language",
+    "transcribing": "transcribing",
+    "cloud_upload": "uploading audio",
 }
 
 
@@ -146,6 +160,56 @@ def _format_local_timestamp(value: str | None) -> str:
     return local.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _compact_preview(text: str | None, limit: int = 120) -> str:
+    if not text:
+        return "-"
+    normalized = " ".join(str(text).split())
+    if not normalized:
+        return "-"
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _summary_preview(summary: dict) -> str:
+    short_summary = summary.get("short_summary") if isinstance(summary, dict) else None
+    if isinstance(short_summary, str) and short_summary.strip():
+        return _compact_preview(short_summary, limit=140)
+    return "No short summary."
+
+
+def _clean_transcript_preview(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return _compact_preview(stripped, limit=140)
+    return "No clean transcript yet."
+
+
+def _processing_log_preview(processing_log: list[dict]) -> str:
+    if not processing_log:
+        return "No processing log entries."
+    latest = processing_log[-1]
+    event = latest.get("event") or "unknown"
+    timestamp = latest.get("at") or latest.get("reviewed_at")
+    if timestamp:
+        return f"Latest: {event} at {_format_local_timestamp(timestamp)}"
+    return f"Latest: {event}"
+
+
+def _task_list_preview(tasks: list[dict]) -> str:
+    if not tasks:
+        return "No tasks."
+    first_text = tasks[0].get("text") if isinstance(tasks[0], dict) else None
+    if isinstance(first_text, str) and first_text.strip():
+        return _compact_preview(first_text, limit=140)
+    return f"{len(tasks)} task(s)"
+
+
+def _error_preview(error_message: str | None, limit: int = 120) -> str:
+    return _compact_preview(error_message, limit=limit)
+
+
 def _median(values: list[float]) -> float | None:
     if not values:
         return None
@@ -212,6 +276,17 @@ def _speaker_identity_context(metadata: dict, assignments: dict[str, dict]) -> d
     return {"speaker_identity_mode": None, "speaker_identity_notice": None}
 
 
+def _transcription_quality_context(metadata: dict) -> dict[str, object]:
+    return {
+        "transcription_selection_strategy": metadata.get("transcription_selection_strategy"),
+        "transcription_retried_languages": metadata.get("transcription_retried_languages", []),
+        "transcription_quality_flags": metadata.get("transcription_quality_flags", []),
+        "transcription_quality_score": metadata.get("transcription_quality_score"),
+        "transcription_low_confidence_reason": metadata.get("transcription_low_confidence_reason"),
+        "transcription_language_detected": metadata.get("transcription_language_detected"),
+    }
+
+
 def _cluster_status_label(assignment_source: str | None, speaker_identity_id: str | None) -> str:
     if assignment_source == "user" and speaker_identity_id:
         return "Confirmed"
@@ -253,33 +328,38 @@ def _call_queue_statuses(db, call_id: str) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def _queue_counts(db) -> dict[str, int]:
+def _queue_counts(config: AppConfig, db) -> dict[str, int]:
     counts = {"running": 0, "queued": 0, "failed": 0}
     rows = db.execute(
         """
-        SELECT status, COUNT(*) AS total
+        SELECT status, started_at, stage, call_id
         FROM queue_jobs
         WHERE status IN ('running', 'queued', 'failed')
-        GROUP BY status
         """
     ).fetchall()
     for row in rows:
-        counts[row["status"]] = int(row["total"])
+        if row["status"] == "running" and is_job_stale(config, row):
+            counts["queued"] += 1
+            continue
+        counts[row["status"]] += 1
     return counts
 
 
-def _current_running_job(db) -> dict | None:
-    row = db.execute(
+def _current_running_job(config: AppConfig, db) -> dict | None:
+    rows = db.execute(
         """
         SELECT q.*, c.duration_seconds
         FROM queue_jobs q
         LEFT JOIN calls c ON c.call_id = q.call_id
         WHERE q.status = 'running'
         ORDER BY (q.started_at IS NULL), q.started_at ASC, q.available_at ASC
-        LIMIT 1
         """
-    ).fetchone()
-    return dict(row) if row else None
+    ).fetchall()
+    for row in rows:
+        if is_job_stale(config, row):
+            continue
+        return dict(row)
+    return None
 
 
 def _completed_stage_runtime_samples(db, stage: str, limit: int = 20) -> list[dict]:
@@ -350,6 +430,11 @@ def _eta_recalc_window_seconds(estimated_total_seconds: float) -> float:
     return max(ETA_RECALC_MIN_SECONDS, min(ETA_RECALC_MAX_SECONDS, estimated_total_seconds * 0.2))
 
 
+def _recalculated_total_seconds(estimated_total_seconds: float, elapsed_seconds: float) -> float:
+    reference_seconds = max(estimated_total_seconds, elapsed_seconds)
+    return elapsed_seconds + _eta_recalc_window_seconds(reference_seconds)
+
+
 def _app_status_label(processing_mode_value: str, counts: dict[str, int]) -> str:
     if counts["running"]:
         return "Running"
@@ -362,6 +447,12 @@ def _app_status_label(processing_mode_value: str, counts: dict[str, int]) -> str
     return "Idle"
 
 
+def _display_progress_step(step_name: str | None) -> str | None:
+    if not step_name:
+        return None
+    return PROGRESS_STEP_LABELS.get(step_name, step_name.replace("_", " "))
+
+
 def _task_status_payload(db, running_job: dict | None) -> dict | None:
     if not running_job:
         return None
@@ -370,6 +461,18 @@ def _task_status_payload(db, running_job: dict | None) -> dict | None:
     if started_at:
         elapsed_seconds = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
     estimated_total_seconds = _estimate_stage_runtime_seconds(db, running_job)
+    progress = get_stage_progress(running_job["call_id"], running_job["stage"]) or {}
+    progress_step_name = progress.get("step_name")
+    progress_step_display = _display_progress_step(progress_step_name)
+    progress_completed = progress.get("completed")
+    progress_total = progress.get("total")
+    progress_fraction: float | None = None
+    progress_percent: float | None = None
+    if isinstance(progress_completed, (int, float)) and isinstance(progress_total, (int, float)) and progress_total > 0:
+        progress_fraction = max(0.0, min(1.0, float(progress_completed) / float(progress_total)))
+        progress_percent = progress_fraction * 100.0
+        if elapsed_seconds is not None and progress_fraction > 0.0 and progress_fraction < 1.0:
+            estimated_total_seconds = max(elapsed_seconds, elapsed_seconds / progress_fraction)
     remaining_seconds: float | None = None
     eta_status = "unknown"
     estimated_finish_display = "unknown"
@@ -385,9 +488,10 @@ def _task_status_payload(db, running_job: dict | None) -> dict | None:
                 estimated_finish_display = f"{_format_local_timestamp(estimated_finish_at_iso)} (about {_format_duration(remaining_seconds)} left)"
             else:
                 eta_status = "recalculating"
-                eta_extension_seconds = _eta_recalc_window_seconds(estimated_total_seconds)
-                remaining_seconds = eta_extension_seconds
-                estimated_finish_at = datetime.now(timezone.utc) + timedelta(seconds=eta_extension_seconds)
+                recalculated_total_seconds = _recalculated_total_seconds(estimated_total_seconds, elapsed_seconds)
+                remaining_seconds = max(0.0, recalculated_total_seconds - elapsed_seconds)
+                eta_extension_seconds = remaining_seconds
+                estimated_finish_at = started_at + timedelta(seconds=recalculated_total_seconds)
                 estimated_finish_at_iso = estimated_finish_at.isoformat()
                 estimated_finish_display = f"{_format_local_timestamp(estimated_finish_at_iso)} (recalculating, about {_format_duration(remaining_seconds)} left)"
         else:
@@ -402,6 +506,11 @@ def _task_status_payload(db, running_job: dict | None) -> dict | None:
         "started_at_display": _format_local_timestamp(running_job.get("started_at")),
         "elapsed_seconds": elapsed_seconds,
         "elapsed_display": _format_duration(elapsed_seconds),
+        "progress_percent": round(progress_percent, 1) if progress_percent is not None else None,
+        "progress_completed": progress_completed,
+        "progress_total": progress_total,
+        "progress_step_name": progress_step_name,
+        "progress_step_display": progress_step_display,
         "estimated_total_seconds": estimated_total_seconds,
         "estimated_total_display": _format_duration(estimated_total_seconds),
         "estimated_finish_at": estimated_finish_at_iso,
@@ -414,9 +523,9 @@ def _task_status_payload(db, running_job: dict | None) -> dict | None:
 
 
 def _app_status_payload(config: AppConfig, db) -> dict:
-    counts = _queue_counts(db)
+    counts = _queue_counts(config, db)
     mode = processing_mode(config)
-    running_job = _current_running_job(db)
+    running_job = _current_running_job(config, db)
     return {
         "server_now": utc_now(),
         "app_status": _app_status_label(mode, counts),
@@ -425,6 +534,44 @@ def _app_status_payload(config: AppConfig, db) -> dict:
         "current_task": _task_status_payload(db, running_job),
         "poll_interval_seconds": STATUS_POLL_INTERVAL_SECONDS,
     }
+
+
+def _log_status_line_snapshot(payload: dict) -> None:
+    task = payload.get("current_task") or {}
+    signature = (
+        payload.get("app_status"),
+        payload.get("processing_mode"),
+        payload.get("counts", {}).get("running"),
+        payload.get("counts", {}).get("queued"),
+        payload.get("counts", {}).get("failed"),
+        task.get("call_id"),
+        task.get("stage"),
+        task.get("eta_status"),
+        task.get("started_at"),
+    )
+    now = time.monotonic()
+    last_signature = _LAST_STATUS_LINE_LOG.get("signature")
+    last_at = float(_LAST_STATUS_LINE_LOG.get("at") or 0.0)
+    if signature == last_signature and (now - last_at) < STATUS_LINE_LOG_INTERVAL_SECONDS:
+        return
+    _LAST_STATUS_LINE_LOG["signature"] = signature
+    _LAST_STATUS_LINE_LOG["at"] = now
+    logger.info(
+        "Status line app_status=%s mode=%s running=%s queued=%s failed=%s call_id=%s stage=%s elapsed=%s progress=%s estimated_total=%s remaining=%s eta_status=%s eta_finish=%s",
+        payload.get("app_status"),
+        payload.get("processing_mode"),
+        payload.get("counts", {}).get("running"),
+        payload.get("counts", {}).get("queued"),
+        payload.get("counts", {}).get("failed"),
+        task.get("call_id"),
+        task.get("stage"),
+        task.get("elapsed_display"),
+        f"{task.get('progress_percent')}%" if task.get("progress_percent") is not None else None,
+        task.get("estimated_total_display"),
+        task.get("remaining_display"),
+        task.get("eta_status"),
+        task.get("estimated_finish_display"),
+    )
 
 
 def _refresh_transcript_outputs(call_dir: Path, config: AppConfig) -> list[dict]:
@@ -539,10 +686,81 @@ def _calls_sort_link(
 def _manual_processing_notice(config: AppConfig) -> str:
     if processing_mode(config) != "manual_step":
         return "Manual processing is disabled in automatic mode."
-    imported_count, call_id, stage_count = run_manual_step(config)
+    _, call_id, stage_count = run_manual_step(config, scan_first=False)
     if not call_id:
-        return f"Imported {imported_count} new calls; no queued job was available."
-    return f"Imported {imported_count} new calls; completed {stage_count} stage(s) for call {call_id}."
+        return "No queued job was available."
+    return f"Completed {stage_count} stage(s) for call {call_id}."
+
+
+def _manual_scan_notice(config: AppConfig) -> str:
+    if processing_mode(config) != "manual_step":
+        return "Manual processing is disabled in automatic mode."
+    imported_count = len(detect_new_calls(config))
+    if not imported_count:
+        return "Scan completed; no new calls imported."
+    return f"Scan completed; imported {imported_count} new call(s)."
+
+
+def _with_notice(url: str, notice: str) -> str:
+    parsed = urlparse(url)
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    params["notice"] = notice
+    return urlunparse(parsed._replace(query=urlencode(params)))
+
+
+def _set_processing_mode_notice(config: AppConfig, requested_mode: str) -> str:
+    normalized_mode = requested_mode.strip().lower()
+    if normalized_mode not in {"automatic", "manual_step"}:
+        return "Unsupported processing mode."
+    current_mode = processing_mode(config)
+    if current_mode == normalized_mode:
+        return f"Processing mode is already {normalized_mode}."
+    config.data.setdefault("processing", {})["startup_mode"] = normalized_mode
+    config.save()
+    logger.info("Processing mode changed mode=%s", normalized_mode)
+    return f"Switched processing mode to {normalized_mode}."
+
+
+def _set_archive_root_notice(config: AppConfig, requested_path: str) -> str:
+    raw_path = requested_path.strip()
+    if not raw_path:
+        return "Calls folder path cannot be empty."
+    normalized = Path(raw_path).expanduser()
+    if not normalized.is_absolute():
+        normalized = (config.root_dir / normalized).resolve()
+    else:
+        normalized = normalized.resolve()
+    config.data.setdefault("paths", {})["archive_root"] = str(normalized)
+    config.save()
+    config.ensure_directories()
+    logger.info("Archive root changed path=%s", normalized)
+    return f"Switched calls folder to {normalized}."
+
+
+def _clear_queue_notice(config: AppConfig) -> str:
+    previous_mode = processing_mode(config)
+    if previous_mode != "manual_step":
+        config.data.setdefault("processing", {})["startup_mode"] = "manual_step"
+        config.save()
+    db = connect(config.sqlite_path)
+    queued_count = db.execute("SELECT COUNT(*) FROM queue_jobs WHERE status = 'queued'").fetchone()[0]
+    failed_count = db.execute("SELECT COUNT(*) FROM queue_jobs WHERE status = 'failed'").fetchone()[0]
+    running_count = db.execute("SELECT COUNT(*) FROM queue_jobs WHERE status = 'running'").fetchone()[0]
+    db.execute("DELETE FROM queue_jobs WHERE status IN ('queued', 'failed')")
+    db.commit()
+    logger.info(
+        "Queue cleared queued=%s failed=%s running=%s mode_before=%s",
+        queued_count,
+        failed_count,
+        running_count,
+        previous_mode,
+    )
+    if running_count:
+        return (
+            f"Cleared {queued_count + failed_count} queued/failed job(s) and switched to manual_step. "
+            f"{running_count} running job(s) may still finish the current stage."
+        )
+    return f"Cleared {queued_count + failed_count} queued/failed job(s) and switched to manual_step."
 
 
 def _shared_ui_context(config: AppConfig, db, notice: str = "") -> dict:
@@ -550,6 +768,7 @@ def _shared_ui_context(config: AppConfig, db, notice: str = "") -> dict:
         "processing_mode": processing_mode(config),
         "notice": notice,
         "status_line": _app_status_payload(config, db),
+        "archive_root_path": str(config.archive_root),
     }
 
 
@@ -557,6 +776,31 @@ def create_app(config: AppConfig) -> FastAPI:
     app = FastAPI(title="Call Assistant")
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
     db = connect(config.sqlite_path)
+    manual_action_lock = threading.Lock()
+    manual_action_state: dict[str, threading.Thread | None] = {"thread": None}
+
+    def _start_manual_action(target, started_notice: str) -> str:
+        if processing_mode(config) != "manual_step":
+            return "Manual processing is disabled in automatic mode."
+        with manual_action_lock:
+            existing = manual_action_state.get("thread")
+            if existing and existing.is_alive():
+                return "Manual processing is already running."
+
+            def runner() -> None:
+                try:
+                    target()
+                except Exception:
+                    logger.exception("Manual action failed")
+                finally:
+                    with manual_action_lock:
+                        if manual_action_state.get("thread") is threading.current_thread():
+                            manual_action_state["thread"] = None
+
+            thread = threading.Thread(target=runner, daemon=True, name="call-assistant-manual-action")
+            manual_action_state["thread"] = thread
+            thread.start()
+        return started_notice
 
     def _load_call(call_id: str) -> tuple[dict, Path]:
         row = db.execute("SELECT * FROM calls WHERE call_id = ?", (call_id,)).fetchone()
@@ -571,7 +815,9 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @app.get("/ui/status-line")
     def status_line():
-        return _app_status_payload(config, db)
+        payload = _app_status_payload(config, db)
+        _log_status_line_snapshot(payload)
+        return payload
 
     @app.get("/calls", response_class=HTMLResponse)
     def calls(
@@ -609,6 +855,7 @@ def create_app(config: AppConfig) -> FastAPI:
             row["display_duration"] = _format_duration(row.get("duration_seconds"))
             row["display_respondent"] = _guess_respondent(row)
             row["display_short_description"] = _short_description(row)
+            row["display_short_description_preview"] = _compact_preview(row["display_short_description"], limit=110)
             row["display_task_count"] = counts[row["call_id"]]
         if not date:
             rows = _filter_calls_by_recent(rows, recent)
@@ -670,8 +917,13 @@ def create_app(config: AppConfig) -> FastAPI:
         metadata = read_json(call_dir / "metadata.json", default={})
         raw_segments = read_json(call_dir / "transcript_segments.json", default=[])
         processing_log = read_json(call_dir / "processing_log.json", default=[])
+        summary = read_json(call_dir / "summary.json", default={})
+        tasks = read_json(call_dir / "tasks.json", default=[])
+        reviewed_tasks = read_json(call_dir / "tasks_reviewed.json", default=[])
+        transcript_clean = (call_dir / "transcript_clean.txt").read_text(encoding="utf-8") if (call_dir / "transcript_clean.txt").exists() else ""
         assignment_by_cluster = call_speaker_assignments(db, call_id)
         segments = _augment_segments_with_assignments(raw_segments, assignment_by_cluster)
+        segment_view = _segment_view(segments)
         speaker_clusters = sorted(
             {
                 item.get("speaker_cluster_id") or item.get("speaker_label")
@@ -686,18 +938,26 @@ def create_app(config: AppConfig) -> FastAPI:
         diarization_context = _diarization_context(processing_log, segments)
         speaker_identity_context = _speaker_identity_context(metadata, assignment_by_cluster)
         queue_statuses = _call_queue_statuses(db, call_id)
+        segment_cluster_ids = {
+            item.get("speaker_cluster_id")
+            for item in segments
+            if item.get("speaker_cluster_id")
+        }
         context = {
             "request": request,
             "call": call,
             "metadata": metadata,
-            "summary": read_json(call_dir / "summary.json", default={}),
-            "tasks": read_json(call_dir / "tasks.json", default=[]),
-            "reviewed_tasks": read_json(call_dir / "tasks_reviewed.json", default=[]),
+            "summary": summary,
+            "summary_preview": _summary_preview(summary),
+            "tasks": tasks,
+            "task_list_preview": _task_list_preview(tasks),
+            "reviewed_tasks": reviewed_tasks,
+            "reviewed_tasks_preview": _task_list_preview(reviewed_tasks),
             "segments": segments,
-            "transcript_clean": (call_dir / "transcript_clean.txt").read_text(encoding="utf-8")
-            if (call_dir / "transcript_clean.txt").exists()
-            else "",
+            "transcript_clean": transcript_clean,
+            "clean_transcript_preview": _clean_transcript_preview(transcript_clean),
             "processing_log": processing_log,
+            "processing_log_preview": _processing_log_preview(processing_log),
             "retranscribe_choices": retranscribe_choices,
             "retranscribe_language_choices": retranscribe_language_choices,
             "selected_retranscribe_choice": selected_choice,
@@ -705,13 +965,20 @@ def create_app(config: AppConfig) -> FastAPI:
             "speaker_clusters": speaker_clusters,
             "speaker_mapping": metadata.get("speaker_mapping", {}),
             "audio_url": f"/calls/{call_id}/audio" if audio_path else None,
-            "segment_view": _segment_view(segments),
+            "segment_view": segment_view,
+            "segment_count": len(segment_view),
+            "speaker_cluster_count": len(segment_cluster_ids or set(speaker_clusters)),
+            "review_task_count": len(tasks),
+            "reviewed_task_count": len(reviewed_tasks),
+            "processing_log_count": len(processing_log),
+            "queue_status_count": len(queue_statuses),
             "speaker_profiles": speaker_profiles,
             "assignment_by_cluster": assignment_by_cluster,
             "cluster_status_label": _cluster_status_label,
             "queue_statuses": queue_statuses,
             **diarization_context,
             **speaker_identity_context,
+            **_transcription_quality_context(metadata),
             **_shared_ui_context(config, db),
         }
         return templates.TemplateResponse(request, "call_detail.html", context)
@@ -766,19 +1033,62 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @app.get("/queue", response_class=HTMLResponse)
     def queue_view(request: Request, notice: str = ""):
+        jobs = list_jobs(config)
+        for job in jobs:
+            error_message = job.get("error_message") or ""
+            job["error_preview"] = _error_preview(error_message)
+            job["error_is_long"] = bool(error_message) and job["error_preview"] != error_message
         return templates.TemplateResponse(
             request,
             "queue.html",
             {
-                "jobs": list_jobs(config),
+                "jobs": jobs,
                 **_shared_ui_context(config, db, notice),
             },
         )
 
     @app.post("/queue/process-next")
-    def process_next_queue_job():
-        notice = _manual_processing_notice(config)
-        return RedirectResponse(url=f"/queue?notice={notice}", status_code=303)
+    def process_next_queue_job(request: Request):
+        def run_processing() -> None:
+            imported_count, call_id, stage_count = run_manual_step(config, scan_first=False)
+            logger.info(
+                "Manual processing finished imported=%s call_id=%s stage_count=%s",
+                imported_count,
+                call_id,
+                stage_count,
+            )
+
+        notice = _start_manual_action(run_processing, "Started manual processing.")
+        target = request.headers.get("referer") or "/queue"
+        return RedirectResponse(url=_with_notice(target, notice), status_code=303)
+
+    @app.post("/queue/scan-incoming")
+    def scan_incoming(request: Request):
+        def run_scan() -> None:
+            imported_count = len(detect_new_calls(config))
+            logger.info("Manual incoming scan finished imported=%s", imported_count)
+
+        notice = _start_manual_action(run_scan, "Started incoming scan.")
+        target = request.headers.get("referer") or "/queue"
+        return RedirectResponse(url=_with_notice(target, notice), status_code=303)
+
+    @app.post("/processing-mode")
+    def update_processing_mode(request: Request, mode: str = Form(...)):
+        notice = _set_processing_mode_notice(config, mode)
+        target = request.headers.get("referer") or "/calls"
+        return RedirectResponse(url=_with_notice(target, notice), status_code=303)
+
+    @app.post("/settings/archive-root")
+    def update_archive_root(request: Request, archive_root: str = Form(...)):
+        notice = _set_archive_root_notice(config, archive_root)
+        target = request.headers.get("referer") or "/calls"
+        return RedirectResponse(url=_with_notice(target, notice), status_code=303)
+
+    @app.post("/queue/clear")
+    def clear_queue(request: Request):
+        notice = _clear_queue_notice(config)
+        target = request.headers.get("referer") or "/queue"
+        return RedirectResponse(url=_with_notice(target, notice), status_code=303)
 
     @app.post("/queue/retry/{job_id}")
     def retry_job(job_id: str):
@@ -932,10 +1242,13 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @app.get("/speakers", response_class=HTMLResponse)
     def speakers(request: Request):
+        profiles = list_speaker_profiles(db)
+        for profile in profiles:
+            profile["display_name_preview"] = _compact_preview(profile.get("display_name"), limit=48)
         return templates.TemplateResponse(
             request,
             "speakers.html",
-            {"request": request, "profiles": list_speaker_profiles(db), **_shared_ui_context(config, db)},
+            {"request": request, "profiles": profiles, **_shared_ui_context(config, db)},
         )
 
     @app.get("/speakers/{speaker_identity_id}", response_class=HTMLResponse)
@@ -943,6 +1256,8 @@ def create_app(config: AppConfig) -> FastAPI:
         detail = speaker_profile_detail(db, speaker_identity_id)
         if not detail:
             raise HTTPException(status_code=404, detail="Speaker profile not found")
+        detail["assignment_count"] = len(detail.get("assignments", []))
+        detail["profile_preview"] = f"Status: {detail.get('status', '-')}, linked calls: {detail.get('linked_calls', 0)}"
         return templates.TemplateResponse(
             request,
             "speaker_detail.html",

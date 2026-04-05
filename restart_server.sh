@@ -18,7 +18,47 @@ if [[ -n "$PIDS" ]]; then
   while read -r pid; do
     [[ -n "$pid" ]] && kill "$pid"
   done <<< "$PIDS"
-  sleep 2
+
+  DEADLINE=$((SECONDS + 15))
+  while [[ $SECONDS -lt $DEADLINE ]]; do
+    STILL_RUNNING=0
+    while read -r pid; do
+      if [[ -n "$pid" ]] && ps -p "$pid" > /dev/null 2>&1; then
+        STILL_RUNNING=1
+        break
+      fi
+    done <<< "$PIDS"
+    [[ $STILL_RUNNING -eq 0 ]] && break
+    sleep 1
+  done
+
+  FORCE_KILL=""
+  while read -r pid; do
+    if [[ -n "$pid" ]] && ps -p "$pid" > /dev/null 2>&1; then
+      FORCE_KILL+="${FORCE_KILL:+ }$pid"
+    fi
+  done <<< "$PIDS"
+
+  if [[ -n "$FORCE_KILL" ]]; then
+    echo "Force stopping unresponsive app process(es): $FORCE_KILL"
+    while read -r pid; do
+      [[ -n "$pid" ]] && kill -9 "$pid"
+    done <<< "$(tr ' ' '\n' <<< "$FORCE_KILL")"
+    sleep 1
+  fi
+fi
+
+PORT_DEADLINE=$((SECONDS + 15))
+while [[ $SECONDS -lt $PORT_DEADLINE ]]; do
+  if ! ss -ltn "sport = :8081" | grep -q LISTEN; then
+    break
+  fi
+  sleep 1
+done
+
+if ss -ltn "sport = :8081" | grep -q LISTEN; then
+  echo "Port 8081 is still busy; aborting restart."
+  exit 1
 fi
 
 echo "Starting app..."

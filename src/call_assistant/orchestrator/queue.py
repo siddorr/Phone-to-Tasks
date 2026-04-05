@@ -68,6 +68,17 @@ def _stale_after_seconds_for_job(config: AppConfig, row) -> int:
     return max(base_stale_seconds, minimum_seconds, scaled_seconds)
 
 
+def is_job_stale(config: AppConfig, row, now: datetime | None = None) -> bool:
+    started_at_raw = row["started_at"] if isinstance(row, dict) else row["started_at"]
+    if not started_at_raw:
+        return False
+    started_at = datetime.fromisoformat(started_at_raw)
+    reference = now or datetime.now(timezone.utc)
+    stale_after_seconds = _stale_after_seconds_for_job(config, row)
+    cutoff = reference - timedelta(seconds=stale_after_seconds)
+    return started_at <= cutoff
+
+
 def _reclaim_stale_running_jobs(config: AppConfig) -> None:
     db = connect(config.sqlite_path)
     running_jobs = db.execute(
@@ -79,9 +90,7 @@ def _reclaim_stale_running_jobs(config: AppConfig) -> None:
     now = datetime.now(timezone.utc)
     for row in running_jobs:
         stale_after_seconds = _stale_after_seconds_for_job(config, row)
-        cutoff = now - timedelta(seconds=stale_after_seconds)
-        started_at = datetime.fromisoformat(row["started_at"])
-        if started_at > cutoff:
+        if not is_job_stale(config, row, now=now):
             continue
         next_status = "queued" if row["attempt_count"] < row["max_attempts"] else "failed"
         error_message = "Reclaimed stale running job after worker interruption"

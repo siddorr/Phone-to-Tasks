@@ -6,10 +6,13 @@
     <style>
       body { font-family: Georgia, serif; margin: 2rem auto; max-width: 1100px; background: #f7f2e8; color: #1e1f1a; }
       table { width: 100%; border-collapse: collapse; background: #fff; }
-      th, td { padding: 0.75rem; border-bottom: 1px solid #ddd4c7; vertical-align: top; }
+      th, td { padding: 0.6rem 0.75rem; border-bottom: 1px solid #ddd4c7; vertical-align: top; }
       form { display: inline; }
       .notice { padding: 0.8rem 1rem; background: #e9f3e4; border: 1px solid #b8d2aa; margin-bottom: 1rem; }
       .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; background: #efe4c8; }
+      .error-preview { color: #5f5d55; }
+      .error-details { margin-top: 0.35rem; }
+      .error-details pre { white-space: pre-wrap; margin: 0.35rem 0 0; max-height: 220px; overflow: auto; background: #fffdf9; border: 1px solid #eee2d2; padding: 0.5rem; }
     </style>
   </head>
   <body>
@@ -39,7 +42,17 @@
           <td>{{ job.stage }}</td>
           <td>{{ job.status }}</td>
           <td>{{ job.attempt_count }}/{{ job.max_attempts }}</td>
-          <td>{{ job.error_message or '' }}</td>
+          <td>
+            {% if job.error_message %}
+            <div class="error-preview">{{ job.error_preview }}</div>
+            {% if job.error_is_long %}
+            <details class="error-details">
+              <summary>Show error</summary>
+              <pre>{{ job.error_message }}</pre>
+            </details>
+            {% endif %}
+            {% endif %}
+          </td>
           <td>
             {% if job.status == 'failed' %}
             <form method="post" action="/queue/retry/{{ job.job_id }}">

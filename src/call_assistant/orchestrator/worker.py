@@ -16,7 +16,12 @@ from call_assistant.ingest.watcher import detect_new_calls
 from call_assistant.orchestrator.queue import claim_next_job, claim_next_job_for_call, complete_job, enqueue, fail_job, reset_running_jobs_on_startup
 from call_assistant.speaker_identity.service import run_speaker_identity_stage
 from call_assistant.transcript_cleaner.service import clean_transcript
-from call_assistant.transcription.service import _looks_mixed_language_problem, _transcription_preferences, transcribe
+from call_assistant.transcription.service import (
+    _looks_mixed_language_problem,
+    _transcription_preferences,
+    load_transcription_candidate_selection,
+    transcribe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +125,15 @@ def _process_transcription(config: AppConfig, call_dir: Path) -> None:
     default_provider, model_override, language_override, language_mode = _transcription_preferences(audio_path, config)
     raw = transcribe(audio_path, config)
     write_json(call_dir / "transcript_raw.json", raw)
+    candidate_selection = load_transcription_candidate_selection(call_dir)
+    selection = candidate_selection.get("selection", {})
+    segment_detection = candidate_selection.get("segment_detection", {})
+    segment_retries = candidate_selection.get("segment_retries", [])
+    clause_detection = candidate_selection.get("clause_detection", {})
+    clause_retries = candidate_selection.get("clause_retries", [])
+    word_span_detection = candidate_selection.get("word_span_detection", {})
+    word_span_retries = candidate_selection.get("word_span_retries", [])
+    word_span_validation = candidate_selection.get("word_span_validation_llm_response", [])
     low_confidence = not raw.segments
     metadata = _update_metadata(
         call_dir,
@@ -131,6 +145,29 @@ def _process_transcription(config: AppConfig, call_dir: Path) -> None:
         transcription_language_override=language_override,
         transcription_language_mode=language_mode,
         mixed_language_suspected=_looks_mixed_language_problem(raw, audio_path),
+        transcription_selection_strategy=selection.get("strategy"),
+        transcription_retried_languages=selection.get("retried_languages", []),
+        transcription_quality_flags=selection.get("quality_flags", []),
+        transcription_quality_score=selection.get("quality_score"),
+        transcription_low_confidence_reason=selection.get("low_confidence_reason"),
+        segment_detection_provider=segment_detection.get("provider"),
+        segment_detection_model=segment_detection.get("model"),
+        segment_detection_suspicious_count=segment_detection.get("suspicious_count"),
+        segment_detection_below_threshold_count=segment_detection.get("below_threshold_count"),
+        segment_detection_threshold_used=segment_detection.get("threshold_used"),
+        segment_detection_retry_count=len(segment_retries),
+        segment_detection_strategy=selection.get("strategy"),
+        clause_retry_candidate_count=clause_detection.get("clause_candidates_detected"),
+        clause_retry_selected_count=clause_detection.get("selected_for_retry"),
+        clause_retry_applied_count=sum(1 for item in clause_retries if item.get("replacement_applied")),
+        word_span_detection_provider=word_span_detection.get("provider"),
+        word_span_detection_model=word_span_detection.get("model"),
+        word_span_detection_count=word_span_detection.get("spans_detected"),
+        word_span_retry_count=len(word_span_retries),
+        word_span_below_threshold_count=word_span_detection.get("below_threshold_count"),
+        word_span_threshold_used=word_span_detection.get("threshold_used"),
+        word_span_replacement_count=sum(1 for item in word_span_retries if item.get("replacement_applied")),
+        word_span_validation_count=len(word_span_validation),
     )
     _record_stage_outcome(call_dir, "transcription", "success", f"Transcription produced {len(raw.segments)} segment(s)")
     _sync_call_row(config, call_dir)
@@ -344,7 +381,14 @@ def run_once(config: AppConfig, scan_first: bool = False) -> bool:
     job = claim_next_job(config)
     if not job:
         return False
-    return _run_claimed_job(config, job)
+    target_call_id = job.call_id
+    processed = _run_claimed_job(config, job)
+    while True:
+        next_job = claim_next_job_for_call(config, target_call_id)
+        if not next_job:
+            break
+        _run_claimed_job(config, next_job)
+    return processed
 
 
 def process_pending(config: AppConfig, scan_first: bool = True) -> int:
@@ -363,8 +407,8 @@ def drain_queue(config: AppConfig) -> int:
     return processed
 
 
-def run_manual_step(config: AppConfig) -> tuple[int, str | None, int]:
-    imported = detect_new_calls(config)
+def run_manual_step(config: AppConfig, scan_first: bool = False) -> tuple[int, str | None, int]:
+    imported = detect_new_calls(config) if scan_first else []
     job = claim_next_job(config)
     if not job:
         return len(imported), None, 0
@@ -392,12 +436,12 @@ class WorkerThread:
         self._started = False
 
     def start(self) -> None:
-        if processing_mode(self.config) == "manual_step":
-            logger.info("Worker startup_mode=manual_step automatic background processing disabled")
-            return
         recovered = reset_running_jobs_on_startup(self.config)
         if recovered:
             logger.warning("Worker startup recovered_running_jobs=%s", recovered)
+        if processing_mode(self.config) == "manual_step":
+            logger.info("Worker startup_mode=manual_step automatic background processing disabled")
+            return
         self._thread.start()
         self._started = True
 

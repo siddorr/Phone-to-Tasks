@@ -5,13 +5,18 @@
     <title>{{ profile.display_name }}</title>
     <style>
       body { font-family: Georgia, serif; margin: 2rem auto; max-width: 1100px; background: #fcf8f1; color: #1e1f1a; }
-      section { background: #fff; margin-bottom: 1rem; padding: 1rem; border: 1px solid #ddd4c7; }
+      section { background: #fff; margin-bottom: 0.85rem; padding: 0.85rem; border: 1px solid #ddd4c7; }
       table { width: 100%; border-collapse: collapse; }
-      th, td { padding: 0.75rem; border-bottom: 1px solid #ddd4c7; text-align: left; }
+      th, td { padding: 0.6rem 0.75rem; border-bottom: 1px solid #ddd4c7; text-align: left; }
       a { color: #234f3d; text-decoration: none; }
       pre { white-space: pre-wrap; }
       .notice { padding: 0.8rem 1rem; background: #e9f3e4; border: 1px solid #b8d2aa; margin-bottom: 1rem; }
       .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; background: #efe4c8; }
+      .collapsible { border: 1px solid #e6dccd; background: #fffdfa; }
+      .collapsible__summary { cursor: pointer; list-style: none; display: flex; justify-content: space-between; gap: 0.75rem; align-items: center; padding: 0.75rem 0.85rem; }
+      .collapsible__summary::-webkit-details-marker { display: none; }
+      .collapsible__body { border-top: 1px solid #eee2d2; padding: 0.85rem; }
+      .compact-pre { margin: 0; max-height: 280px; overflow: auto; background: #fffdf9; border: 1px solid #eee2d2; padding: 0.75rem; }
     </style>
   </head>
   <body>
@@ -23,7 +28,11 @@
     {% include "status_line.html" %}
     <section>
       <h2>Profile</h2>
-      <pre>{{ profile | tojson(indent=2) }}</pre>
+      <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem;">
+        <span class="badge">{{ profile.status }}</span>
+        <span class="badge">{{ assignment_count }} assignment(s)</span>
+        <span>{{ profile_preview }}</span>
+      </div>
       <form method="post" action="/speakers/{{ profile.speaker_identity_id }}/rename">
         <label>Display name</label>
         <input type="text" name="display_name" value="{{ profile.display_name }}">
@@ -34,6 +43,15 @@
         <button type="submit">Archive profile</button>
       </form>
       {% endif %}
+      <details class="collapsible" style="margin-top: 0.75rem;">
+        <summary class="collapsible__summary">
+          <span><strong>Raw Profile</strong></span>
+          <span>{{ profile_preview }}</span>
+        </summary>
+        <div class="collapsible__body">
+          <pre class="compact-pre">{{ profile | tojson(indent=2) }}</pre>
+        </div>
+      </details>
     </section>
     <section>
       <h2>Assignments</h2>
