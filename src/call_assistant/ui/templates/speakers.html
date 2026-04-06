@@ -4,12 +4,14 @@
     <meta charset="utf-8">
     <title>Speakers</title>
     <style>
-      body { font-family: Georgia, serif; margin: 2rem auto; max-width: 1100px; background: #fcf8f1; color: #1e1f1a; }
-      table { width: 100%; border-collapse: collapse; background: #fff; }
-      th, td { padding: 0.6rem 0.75rem; border-bottom: 1px solid #ddd4c7; text-align: left; }
-      a { color: #234f3d; text-decoration: none; }
-      .notice { padding: 0.8rem 1rem; background: #e9f3e4; border: 1px solid #b8d2aa; margin-bottom: 1rem; }
-      .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; background: #efe4c8; }
+      :root { --page-bg: #fcf8f1; --text-color: #1e1f1a; --link-color: #234f3d; --panel-bg: #fff; --border-color: #ddd4c7; --badge-bg: rgba(214, 122, 32, 0.18); --notice-bg: #e9f3e4; --notice-border: #b8d2aa; --muted-text: #5f5d55; --badge-running-bg: #dcebd9; --badge-paused-bg: #f2e1b8; --badge-alert-bg: #f1d1cb; --badge-idle-bg: #e8e1d4; --warning-text: #8a5f17; }
+      body[data-theme="dark"] { --page-bg: #12171c; --text-color: #e5e7eb; --link-color: #9ed7c0; --panel-bg: #1f2730; --border-color: #394654; --badge-bg: rgba(232, 140, 44, 0.22); --notice-bg: #1f3a2d; --notice-border: #426a55; --muted-text: #a8b3bf; --badge-running-bg: #2e5b45; --badge-paused-bg: #6a5725; --badge-alert-bg: #6a3834; --badge-idle-bg: #394654; --warning-text: #f3c66c; }
+      body { font-family: Georgia, serif; margin: 2rem auto; max-width: 1100px; background: var(--page-bg); color: var(--text-color); }
+      table { width: 100%; border-collapse: collapse; background: var(--panel-bg); }
+      th, td { padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border-color); text-align: left; }
+      a { color: var(--link-color); text-decoration: none; }
+      .notice { padding: 0.8rem 1rem; background: var(--notice-bg); border: 1px solid var(--notice-border); margin-bottom: 1rem; }
+      .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; background: var(--badge-bg); }
     </style>
   </head>
   <body>

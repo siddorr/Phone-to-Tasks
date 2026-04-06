@@ -15,6 +15,18 @@ The project uses an archive-based pipeline instead of the original SQLite-only p
 - A local FastAPI UI exposes calls, task review, retranscription, speaker mapping, and queue state
 - A background worker scans for new recordings continuously and processes queued jobs stage by stage
 
+## Changes Since v0.2.0
+
+Brief additions in `v0.2.1`:
+
+- speaker identity stage with speaker profiles, assignments, suggestions, and speaker pages
+- real diarization integration plus clearer fallback handling
+- retranscribe improvements including model/language selection and batch retranscribe CLI
+- transcription quality recovery with forced-Hebrew retry for suspicious short calls
+- recorded-time extraction from filename/media metadata plus backfill CLI
+- manual-mode queue improvements, stale-job recovery, and better live status reporting
+- more compact UI with collapsible long blocks and a manual QA checklist
+
 ## Implemented Features
 
 Current app capabilities:

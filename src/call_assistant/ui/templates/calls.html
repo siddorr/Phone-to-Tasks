@@ -4,19 +4,26 @@
     <meta charset="utf-8">
     <title>Calls</title>
     <style>
-      body { font-family: Georgia, serif; margin: 2rem auto; max-width: 1350px; background: linear-gradient(180deg, #f7f2e8, #fffdf9); color: #1e1f1a; }
-      a { color: #234f3d; text-decoration: none; }
-      table { width: 100%; border-collapse: collapse; background: #fff; }
-      th, td { padding: 0.6rem 0.75rem; border-bottom: 1px solid #ddd4c7; vertical-align: top; }
-      .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; background: #efe4c8; }
-      .notice { padding: 0.8rem 1rem; background: #e9f3e4; border: 1px solid #b8d2aa; margin-bottom: 1rem; }
+      :root { --page-bg: linear-gradient(180deg, #f7f2e8, #fffdf9); --text-color: #1e1f1a; --link-color: #234f3d; --panel-bg: #fff; --border-color: #ddd4c7; --badge-bg: rgba(214, 122, 32, 0.18); --notice-bg: #e9f3e4; --notice-border: #b8d2aa; --muted-text: #5f5d55; --badge-running-bg: #dcebd9; --badge-paused-bg: #f2e1b8; --badge-alert-bg: #f1d1cb; --badge-idle-bg: #e8e1d4; --warning-text: #8a5f17; --control-bg: rgba(214, 122, 32, 0.08); --control-border: rgba(179, 94, 18, 0.35); --control-hover: rgba(214, 122, 32, 0.16); --control-text: #5a3410; --control-focus: rgba(214, 122, 32, 0.28); }
+      body[data-theme="dark"] { --page-bg: linear-gradient(180deg, #12171c, #1b2229); --text-color: #e5e7eb; --link-color: #9ed7c0; --panel-bg: #1f2730; --border-color: #394654; --badge-bg: rgba(232, 140, 44, 0.22); --notice-bg: #1f3a2d; --notice-border: #426a55; --muted-text: #a8b3bf; --badge-running-bg: #2e5b45; --badge-paused-bg: #6a5725; --badge-alert-bg: #6a3834; --badge-idle-bg: #394654; --warning-text: #f3c66c; --control-bg: rgba(232, 140, 44, 0.16); --control-border: rgba(232, 140, 44, 0.35); --control-hover: rgba(232, 140, 44, 0.24); --control-text: #f6d4a7; --control-focus: rgba(232, 140, 44, 0.4); }
+      body { font-family: Georgia, serif; margin: 2rem auto; max-width: 1350px; background: var(--page-bg); color: var(--text-color); }
+      a { color: var(--link-color); text-decoration: none; }
+      table { width: 100%; border-collapse: collapse; background: var(--panel-bg); }
+      th, td { padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border-color); vertical-align: top; }
+      .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; background: var(--badge-bg); }
+      .notice { padding: 0.8rem 1rem; background: var(--notice-bg); border: 1px solid var(--notice-border); margin-bottom: 1rem; }
       form { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr auto auto; gap: 0.75rem; margin-bottom: 1rem; }
-      .upload-form { grid-template-columns: 1fr auto; align-items: center; background: #fff; padding: 1rem; border: 1px solid #ddd4c7; }
-      .settings-form { grid-template-columns: 1fr auto; align-items: center; background: #fff; padding: 1rem; border: 1px solid #ddd4c7; }
-      .settings-label { font-size: 0.92rem; color: #5f5d55; margin-bottom: 0.35rem; display: block; }
-      input, button, select { padding: 0.55rem; }
+      .upload-form { grid-template-columns: 1fr auto; align-items: center; background: var(--panel-bg); padding: 1rem; border: 1px solid var(--border-color); }
+      .settings-form { grid-template-columns: 1fr auto; align-items: center; background: var(--panel-bg); padding: 1rem; border: 1px solid var(--border-color); }
+      .settings-label { font-size: 0.92rem; color: var(--muted-text); margin-bottom: 0.35rem; display: block; }
+      input, button, select { padding: 0.55rem; border: 1px solid var(--control-border); background: var(--control-bg); color: var(--text-color); border-radius: 0.45rem; }
+      button { background: var(--control-bg); color: var(--control-text); cursor: pointer; }
+      button:hover, select:hover, input:hover { background: var(--control-hover); }
+      input:focus, button:focus, select:focus { outline: 2px solid var(--control-focus); outline-offset: 1px; }
+      input[type="file"]::file-selector-button { margin-right: 0.75rem; padding: 0.5rem 0.8rem; border: 1px solid var(--control-border); background: var(--control-bg); color: var(--control-text); border-radius: 0.4rem; cursor: pointer; }
+      input[type="file"]::file-selector-button:hover { background: var(--control-hover); }
       th a { color: inherit; display: inline-flex; gap: 0.35rem; align-items: center; }
-      .muted-link { color: #6d6d64; }
+      .muted-link { color: var(--muted-text); }
       .description-preview {
         display: -webkit-box;
         -webkit-box-orient: vertical;
@@ -61,6 +68,7 @@
       <thead>
         <tr>
           <th><a href="{{ sort_links['recorded_at'] }}">Recorded Date/Time {% if sort_by == "recorded_at" %}{{ "↑" if sort_dir == "asc" else "↓" }}{% endif %}</a></th>
+          <th>Call ID</th>
           <th>Duration</th>
           <th><a href="{{ sort_links['respondent'] }}">Respondent {% if sort_by == "respondent" %}{{ "↑" if sort_dir == "asc" else "↓" }}{% endif %}</a></th>
           <th><a href="{{ sort_links['state'] }}">State {% if sort_by == "state" %}{{ "↑" if sort_dir == "asc" else "↓" }}{% endif %}</a></th>
@@ -72,6 +80,7 @@
         {% for call in calls %}
         <tr>
           <td><a href="/calls/{{ call.call_id }}">{{ call.display_recorded_at }}</a></td>
+          <td><a href="/calls/{{ call.call_id }}">{{ call.display_call_short_id }}</a></td>
           <td>{{ call.display_duration }}</td>
           <td>{{ call.display_respondent }}</td>
           <td>{{ call.current_state }}</td>
@@ -85,7 +94,7 @@
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="6">No calls indexed yet.</td></tr>
+        <tr><td colspan="7">No calls indexed yet.</td></tr>
         {% endfor %}
       </tbody>
     </table>

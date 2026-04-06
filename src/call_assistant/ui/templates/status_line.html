@@ -1,18 +1,18 @@
 <style>
-  .status-line { padding: 0.9rem 1rem; background: #fff; border: 1px solid #ddd4c7; margin-bottom: 1rem; display: grid; gap: 0.75rem; }
+  .status-line { padding: 0.9rem 1rem; background: var(--panel-bg); border: 1px solid var(--border-color); margin-bottom: 1rem; display: grid; gap: 0.75rem; }
   .status-line__top { display: flex; gap: 0.75rem; align-items: center; justify-content: space-between; flex-wrap: wrap; }
   .status-line__summary { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
   .status-line__group { display: flex; gap: 0.4rem; align-items: baseline; flex-wrap: wrap; }
-  .status-line__label { color: #5f5d55; font-size: 0.94rem; }
+  .status-line__label { color: var(--muted-text); font-size: 0.94rem; }
   .status-line__task { display: flex; gap: 0.85rem; flex-wrap: wrap; align-items: center; }
-  .status-line__badge { display: inline-block; padding: 0.2rem 0.55rem; border-radius: 999px; background: #efe4c8; }
-  .status-line--Running .status-line__badge--app { background: #dcebd9; }
-  .status-line--Paused .status-line__badge--app { background: #f2e1b8; }
-  .status-line--Needs\ attention .status-line__badge--app { background: #f1d1cb; }
+  .status-line__badge { display: inline-block; padding: 0.2rem 0.55rem; border-radius: 999px; background: var(--badge-bg); color: var(--text-color); }
+  .status-line--Running .status-line__badge--app { background: var(--badge-running-bg); }
+  .status-line--Paused .status-line__badge--app { background: var(--badge-paused-bg); }
+  .status-line--Needs\ attention .status-line__badge--app { background: var(--badge-alert-bg); }
   .status-line--Idle .status-line__badge--app,
-  .status-line--Backlog .status-line__badge--app { background: #e8e1d4; }
+  .status-line--Backlog .status-line__badge--app { background: var(--badge-idle-bg); }
   .status-line__actions form { margin: 0; }
-  .status-line__live-note { color: #8a5f17; font-size: 0.92rem; }
+  .status-line__live-note { color: var(--warning-text); font-size: 0.92rem; }
 </style>
 <div
   id="app-status-line"
@@ -51,6 +51,7 @@
         <form method="post" action="/queue/clear">
           <button type="submit">Empty Queue</button>
         </form>
+        <button type="button" id="theme-toggle-button">Night Look</button>
         {% if status_line.processing_mode == 'manual_step' %}
         <form method="post" action="/queue/process-next">
           <button type="submit">Process Next Call</button>

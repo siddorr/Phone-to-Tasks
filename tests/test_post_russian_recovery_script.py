@@ -21,6 +21,40 @@ from call_assistant.common.models import RawSegment, RawTranscript
 
 
 class PostRussianRecoveryScriptTests(unittest.TestCase):
+    def test_load_manifest_resolves_relative_expected_transcript_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            archive_root = temp_root / "calls"
+            archive_call_dir = archive_root / "2026" / "04" / "04" / "call_test_call"
+            archive_call_dir.mkdir(parents=True)
+            expected_dir = ROOT / "data" / "eval" / "post_russian_recovery" / "examples" / "call_example"
+            manifest_path = temp_root / "manifest.json"
+            manifest_path.write_text(
+                json_dumps(
+                    {
+                        "calls": [
+                            {
+                                "call_id": "test_call",
+                                "call_dir": str(archive_call_dir),
+                                "expected_transcript_path": "data/eval/post_russian_recovery/examples/call_example/expected_transcript.txt",
+                                "description": "fixture",
+                                "tags": ["mixed"],
+                                "priority_weight": 2.0,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = AppConfig.load(ROOT / "config.yaml")
+
+            entries = MODULE.load_manifest(manifest_path, config)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].call_id, "test_call")
+        self.assertEqual(entries[0].expected_transcript_path, expected_dir / "expected_transcript.txt")
+        self.assertEqual(entries[0].priority_weight, 2.0)
+
     def test_normalize_expected_text_strips_speaker_lines(self) -> None:
         text = """
         [00:00] speaker_1 Unassigned
@@ -193,6 +227,101 @@ class PostRussianRecoveryScriptTests(unittest.TestCase):
 
         self.assertEqual(ranked[0].name, "better")
         self.assertIn("1. better", text)
+
+    def test_aggregate_variant_results_ranks_by_weighted_composite(self) -> None:
+        baseline = MODULE.VariantResult(
+            name="current",
+            overrides={},
+            elapsed_seconds=1.0,
+            selected_strategy="baseline",
+            selected_text="baseline",
+            scores=MODULE.MatchScores(0.6, 0.6, 0.6, 0.6, 0.5, 0.5, 0.5, 0.6),
+            suspicious_segments=0,
+            suspicious_word_spans=0,
+            selected_word_spans=0,
+            applied_replacements=0,
+            candidate_diagnostics=[],
+            word_span_retries=[],
+        )
+        better = MODULE.VariantResult(
+            name="phrase_windows",
+            overrides={},
+            elapsed_seconds=1.0,
+            selected_strategy="baseline",
+            selected_text="better",
+            scores=MODULE.MatchScores(0.8, 0.8, 0.8, 0.8, 0.7, 0.7, 0.7, 0.8),
+            suspicious_segments=0,
+            suspicious_word_spans=0,
+            selected_word_spans=0,
+            applied_replacements=0,
+            candidate_diagnostics=[],
+            word_span_retries=[],
+        )
+        call_result = MODULE.CallEvaluationResult(
+            entry=MODULE.EvaluationManifestEntry(
+                call_id="call_a",
+                call_dir=Path("/tmp/call_a"),
+                expected_transcript_path=Path("/tmp/expected.txt"),
+                priority_weight=1.5,
+            ),
+            baseline=None,
+            expected_text="expected",
+            variants=[baseline, better],
+        )
+
+        aggregate = MODULE.aggregate_variant_results([call_result])
+
+        self.assertEqual(aggregate[0].name, "phrase_windows")
+        self.assertGreater(aggregate[0].weighted_composite, aggregate[1].weighted_composite)
+
+    def test_write_aggregate_json_report_includes_calls_and_ranked_variants(self) -> None:
+        call_result = MODULE.CallEvaluationResult(
+            entry=MODULE.EvaluationManifestEntry(
+                call_id="call_a",
+                call_dir=Path("/tmp/call_a"),
+                expected_transcript_path=Path("/tmp/expected.txt"),
+                description="fixture call",
+                tags=["mixed"],
+                priority_weight=1.0,
+            ),
+            baseline=RawTranscript(provider="local", model="m", language="ru", confidence=None, segments=[], text="baseline"),
+            expected_text="expected",
+            variants=[],
+        )
+        aggregate = [
+            MODULE.AggregateVariantResult(
+                name="current",
+                success_count=1,
+                failure_count=0,
+                weighted_composite=0.7,
+                weighted_char_ratio=0.7,
+                weighted_token_f1=0.7,
+                weighted_critical_phrase_f1=0.7,
+                weighted_delta_composite_vs_baseline=0.0,
+                weighted_delta_phrase_f1_vs_baseline=0.0,
+                regression_flagged_calls=0,
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "aggregate.json"
+            MODULE.write_aggregate_json_report(output_path, ROOT / "manifest.json", [call_result], aggregate)
+            payload = json_loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["calls"][0]["call_id"], "call_a")
+        self.assertEqual(payload["aggregate"]["ranked_variants"][0]["name"], "current")
+
+
+def json_dumps(payload: object) -> str:
+    import json
+
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def json_loads(text: str):
+    import json
+
+    return json.loads(text)
 
 
 if __name__ == "__main__":

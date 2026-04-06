@@ -4,15 +4,21 @@
     <meta charset="utf-8">
     <title>Queue</title>
     <style>
-      body { font-family: Georgia, serif; margin: 2rem auto; max-width: 1100px; background: #f7f2e8; color: #1e1f1a; }
-      table { width: 100%; border-collapse: collapse; background: #fff; }
-      th, td { padding: 0.6rem 0.75rem; border-bottom: 1px solid #ddd4c7; vertical-align: top; }
+      :root { --page-bg: #f7f2e8; --text-color: #1e1f1a; --link-color: #234f3d; --panel-bg: #fff; --panel-soft-bg: #fffdf9; --border-color: #ddd4c7; --soft-border-color: #eee2d2; --badge-bg: rgba(214, 122, 32, 0.18); --notice-bg: #e9f3e4; --notice-border: #b8d2aa; --muted-text: #5f5d55; --badge-running-bg: #dcebd9; --badge-paused-bg: #f2e1b8; --badge-alert-bg: #f1d1cb; --badge-idle-bg: #e8e1d4; --warning-text: #8a5f17; --control-bg: rgba(214, 122, 32, 0.08); --control-border: rgba(179, 94, 18, 0.35); --control-hover: rgba(214, 122, 32, 0.16); --control-text: #5a3410; --control-focus: rgba(214, 122, 32, 0.28); }
+      body[data-theme="dark"] { --page-bg: #12171c; --text-color: #e5e7eb; --link-color: #9ed7c0; --panel-bg: #1f2730; --panel-soft-bg: #232d37; --border-color: #394654; --soft-border-color: #465466; --badge-bg: rgba(232, 140, 44, 0.22); --notice-bg: #1f3a2d; --notice-border: #426a55; --muted-text: #a8b3bf; --badge-running-bg: #2e5b45; --badge-paused-bg: #6a5725; --badge-alert-bg: #6a3834; --badge-idle-bg: #394654; --warning-text: #f3c66c; --control-bg: rgba(232, 140, 44, 0.16); --control-border: rgba(232, 140, 44, 0.35); --control-hover: rgba(232, 140, 44, 0.24); --control-text: #f6d4a7; --control-focus: rgba(232, 140, 44, 0.4); }
+      body { font-family: Georgia, serif; margin: 2rem auto; max-width: 1100px; background: var(--page-bg); color: var(--text-color); }
+      a { color: var(--link-color); }
+      table { width: 100%; border-collapse: collapse; background: var(--panel-bg); }
+      th, td { padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border-color); vertical-align: top; }
       form { display: inline; }
-      .notice { padding: 0.8rem 1rem; background: #e9f3e4; border: 1px solid #b8d2aa; margin-bottom: 1rem; }
-      .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; background: #efe4c8; }
-      .error-preview { color: #5f5d55; }
+      button { padding: 0.55rem; border: 1px solid var(--control-border); background: var(--control-bg); color: var(--control-text); border-radius: 0.45rem; cursor: pointer; }
+      button:hover { background: var(--control-hover); }
+      button:focus { outline: 2px solid var(--control-focus); outline-offset: 1px; }
+      .notice { padding: 0.8rem 1rem; background: var(--notice-bg); border: 1px solid var(--notice-border); margin-bottom: 1rem; }
+      .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; background: var(--badge-bg); }
+      .error-preview { color: var(--muted-text); }
       .error-details { margin-top: 0.35rem; }
-      .error-details pre { white-space: pre-wrap; margin: 0.35rem 0 0; max-height: 220px; overflow: auto; background: #fffdf9; border: 1px solid #eee2d2; padding: 0.5rem; }
+      .error-details pre { white-space: pre-wrap; margin: 0.35rem 0 0; max-height: 220px; overflow: auto; background: var(--panel-soft-bg); border: 1px solid var(--soft-border-color); padding: 0.5rem; }
     </style>
   </head>
   <body>

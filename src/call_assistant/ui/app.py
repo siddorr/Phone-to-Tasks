@@ -852,6 +852,7 @@ def create_app(config: AppConfig) -> FastAPI:
         for row in rows:
             row["display_recorded_at"] = row.get("recorded_at") or row.get("imported_at")
             row["display_recorded_at_badge"] = _recorded_at_badge(row.get("recorded_at_source"), row.get("recorded_at"))
+            row["display_call_short_id"] = str(row.get("call_id", "")).rsplit("_", 1)[-1]
             row["display_duration"] = _format_duration(row.get("duration_seconds"))
             row["display_respondent"] = _guess_respondent(row)
             row["display_short_description"] = _short_description(row)

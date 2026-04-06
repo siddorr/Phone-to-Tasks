@@ -1,5 +1,23 @@
 <script>
 (() => {
+  const THEME_KEY = "call-assistant-theme";
+  const applyTheme = (theme) => {
+    const normalized = theme === "dark" ? "dark" : "light";
+    document.body.dataset.theme = normalized;
+    const button = document.getElementById("theme-toggle-button");
+    if (button) button.textContent = normalized === "dark" ? "Day Look" : "Night Look";
+  };
+
+  applyTheme(localStorage.getItem(THEME_KEY) || "light");
+  const themeToggle = document.getElementById("theme-toggle-button");
+  if (themeToggle) {
+    themeToggle.addEventListener("click", () => {
+      const nextTheme = document.body.dataset.theme === "dark" ? "light" : "dark";
+      localStorage.setItem(THEME_KEY, nextTheme);
+      applyTheme(nextTheme);
+    });
+  }
+
   const root = document.getElementById("app-status-line");
   if (!root) return;
 

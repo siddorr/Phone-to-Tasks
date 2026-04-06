@@ -10,6 +10,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -72,6 +73,7 @@ CRITICAL_EXPECTED_PHRASES = [
     "התאמה לתקציב",
     "интересно глянуть",
 ]
+TURN_LINE_RE = re.compile(r"^(speaker_[^:]+):\s*(.+)$", re.IGNORECASE)
 
 
 @dataclass
@@ -106,6 +108,40 @@ class VariantResult:
     applied_replacements: int
     candidate_diagnostics: list[dict[str, Any]]
     word_span_retries: list[dict[str, Any]]
+
+
+@dataclass
+class EvaluationManifestEntry:
+    call_id: str
+    expected_transcript_path: Path | None = None
+    expected_case_path: Path | None = None
+    call_dir: Path | None = None
+    description: str = ""
+    tags: list[str] | None = None
+    priority_weight: float = 1.0
+
+
+@dataclass
+class CallEvaluationResult:
+    entry: EvaluationManifestEntry
+    baseline: RawTranscript | None
+    expected_text: str | None
+    variants: list[VariantResult]
+    error: str | None = None
+
+
+@dataclass
+class AggregateVariantResult:
+    name: str
+    success_count: int
+    failure_count: int
+    weighted_composite: float
+    weighted_char_ratio: float
+    weighted_token_f1: float
+    weighted_critical_phrase_f1: float
+    weighted_delta_composite_vs_baseline: float
+    weighted_delta_phrase_f1_vs_baseline: float
+    regression_flagged_calls: int
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -242,6 +278,103 @@ def build_default_variants() -> list[VariantSpec]:
 
 def variant_config(base_config: AppConfig, overrides: dict[str, Any]) -> AppConfig:
     return AppConfig(data=_deep_merge(base_config.data, overrides), root_dir=base_config.root_dir)
+
+
+def _repo_path(path_value: str | Path) -> Path:
+    candidate = Path(path_value)
+    return candidate if candidate.is_absolute() else (ROOT / candidate)
+
+
+def _find_call_dir(config: AppConfig, call_id: str) -> Path:
+    matches = sorted(config.archive_root.rglob(f"call_{call_id}"))
+    if not matches:
+        raise FileNotFoundError(f"Could not locate call directory for {call_id}")
+    return matches[0]
+
+
+def load_manifest(manifest_path: Path, config: AppConfig) -> list[EvaluationManifestEntry]:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    items = payload["calls"] if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        raise ValueError("Manifest must be a list or an object with a 'calls' list")
+    entries: list[EvaluationManifestEntry] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("Manifest entries must be objects")
+        call_id = str(item.get("call_id") or "").strip()
+        if not call_id:
+            raise ValueError("Manifest entry missing call_id")
+        expected_case_value = item.get("expected_case_path")
+        expected_case_path = _repo_path(expected_case_value) if expected_case_value else None
+        if expected_case_path is not None and not expected_case_path.exists():
+            raise FileNotFoundError(f"Expected case path does not exist for {call_id}: {expected_case_path}")
+        expected_path = None
+        if expected_case_path is None:
+            expected_value = item.get("expected_transcript_path")
+            if not expected_value:
+                raise ValueError(f"Manifest entry for {call_id} missing expected_case_path or expected_transcript_path")
+            expected_path = _repo_path(expected_value)
+            if not expected_path.exists():
+                raise FileNotFoundError(f"Expected transcript path does not exist for {call_id}: {expected_path}")
+        call_dir_value = item.get("call_dir")
+        call_dir = _repo_path(call_dir_value) if call_dir_value else _find_call_dir(config, call_id)
+        entries.append(
+            EvaluationManifestEntry(
+                call_id=call_id,
+                call_dir=call_dir,
+                expected_transcript_path=expected_path,
+                expected_case_path=expected_case_path,
+                description=str(item.get("description") or ""),
+                tags=[str(tag) for tag in item.get("tags", [])],
+                priority_weight=float(item.get("priority_weight", 1.0) or 1.0),
+            )
+        )
+    return entries
+
+
+def load_expected_case(entry: EvaluationManifestEntry) -> tuple[str, list[dict[str, Any]] | None]:
+    if entry.expected_case_path is not None:
+        if entry.expected_case_path.suffix.lower() == ".json":
+            payload = json.loads(entry.expected_case_path.read_text(encoding="utf-8"))
+            expected_text = normalize_expected_text(str(payload.get("expected_transcript") or ""))
+            if not expected_text:
+                raise ValueError(f"Expected case for {entry.call_id} is missing expected_transcript")
+            turns = payload.get("expected_turns")
+            return expected_text, turns if isinstance(turns, list) else None
+        turns: list[dict[str, Any]] = []
+        for raw_line in entry.expected_case_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            match = TURN_LINE_RE.match(line)
+            if not match:
+                continue
+            speaker, text = match.groups()
+            text = text.strip()
+            if not text:
+                continue
+            turns.append({"speaker": speaker.strip(), "text": text})
+        if not turns:
+            raise ValueError(f"Expected case for {entry.call_id} does not contain any speaker turns")
+        expected_text = normalize_expected_text(" ".join(item["text"] for item in turns))
+        return expected_text, turns
+    if entry.expected_transcript_path is None:
+        raise ValueError(f"Expected transcript path is missing for {entry.call_id}")
+    expected_text = normalize_expected_text(entry.expected_transcript_path.read_text(encoding="utf-8"))
+    return expected_text, None
+
+
+def select_variants(specs: list[VariantSpec], selected_names: list[str], baseline_only: bool) -> list[VariantSpec]:
+    if baseline_only:
+        return [item for item in specs if item.name == "current"]
+    if not selected_names:
+        return specs
+    wanted = set(selected_names)
+    filtered = [item for item in specs if item.name in wanted]
+    missing = sorted(wanted - {item.name for item in filtered})
+    if missing:
+        raise ValueError(f"Unknown variant(s): {', '.join(missing)}")
+    return filtered
 
 
 def resolve_audio_path(call_dir: Path) -> Path:
@@ -469,21 +602,296 @@ def persist_reports(
     return ranked
 
 
+def evaluate_call(
+    entry: EvaluationManifestEntry,
+    config: AppConfig,
+    specs: list[VariantSpec],
+    baseline_language: str,
+) -> CallEvaluationResult:
+    try:
+        call_dir = entry.call_dir or _find_call_dir(config, entry.call_id)
+        audio_path = resolve_audio_path(call_dir)
+        expected_text, _ = load_expected_case(entry)
+        baseline = _transcribe_local(
+            audio_path,
+            config,
+            model_override=config.section("transcription").get("local_model"),
+            language_override=baseline_language,
+            language_mode="metadata_override",
+        )
+        variants = [run_variant(baseline, audio_path, config, spec, expected_text) for spec in specs]
+        return CallEvaluationResult(entry=entry, baseline=baseline, expected_text=expected_text, variants=variants)
+    except Exception as exc:
+        return CallEvaluationResult(entry=entry, baseline=None, expected_text=None, variants=[], error=str(exc))
+
+
+def _regression_flag(baseline: VariantResult, candidate: VariantResult) -> bool:
+    composite_improvement = candidate.scores.composite - baseline.scores.composite
+    token_precision_delta = candidate.scores.token_precision - baseline.scores.token_precision
+    phrase_recall_delta = candidate.scores.critical_phrase_recall - baseline.scores.critical_phrase_recall
+    return composite_improvement < 0.01 and (token_precision_delta <= -0.05 or phrase_recall_delta <= -0.10)
+
+
+def aggregate_variant_results(call_results: list[CallEvaluationResult]) -> list[AggregateVariantResult]:
+    per_variant: dict[str, dict[str, float]] = {}
+    failed_calls = sum(1 for item in call_results if item.error)
+    for call_result in call_results:
+        if call_result.error or not call_result.variants:
+            continue
+        baseline = next((item for item in call_result.variants if item.name == "current"), call_result.variants[0])
+        weight = max(0.0, float(call_result.entry.priority_weight or 1.0))
+        for variant in call_result.variants:
+            bucket = per_variant.setdefault(
+                variant.name,
+                {
+                    "weight_total": 0.0,
+                    "weighted_composite": 0.0,
+                    "weighted_char_ratio": 0.0,
+                    "weighted_token_f1": 0.0,
+                    "weighted_critical_phrase_f1": 0.0,
+                    "weighted_delta_composite_vs_baseline": 0.0,
+                    "weighted_delta_phrase_f1_vs_baseline": 0.0,
+                    "success_count": 0.0,
+                    "regression_flagged_calls": 0.0,
+                },
+            )
+            bucket["weight_total"] += weight
+            bucket["weighted_composite"] += variant.scores.composite * weight
+            bucket["weighted_char_ratio"] += variant.scores.char_ratio * weight
+            bucket["weighted_token_f1"] += variant.scores.token_f1 * weight
+            bucket["weighted_critical_phrase_f1"] += variant.scores.critical_phrase_f1 * weight
+            bucket["weighted_delta_composite_vs_baseline"] += (variant.scores.composite - baseline.scores.composite) * weight
+            bucket["weighted_delta_phrase_f1_vs_baseline"] += (
+                variant.scores.critical_phrase_f1 - baseline.scores.critical_phrase_f1
+            ) * weight
+            bucket["success_count"] += 1
+            if variant.name != baseline.name and _regression_flag(baseline, variant):
+                bucket["regression_flagged_calls"] += 1
+    aggregate: list[AggregateVariantResult] = []
+    for name, bucket in per_variant.items():
+        weight_total = bucket["weight_total"] or 1.0
+        aggregate.append(
+            AggregateVariantResult(
+                name=name,
+                success_count=int(bucket["success_count"]),
+                failure_count=failed_calls,
+                weighted_composite=bucket["weighted_composite"] / weight_total,
+                weighted_char_ratio=bucket["weighted_char_ratio"] / weight_total,
+                weighted_token_f1=bucket["weighted_token_f1"] / weight_total,
+                weighted_critical_phrase_f1=bucket["weighted_critical_phrase_f1"] / weight_total,
+                weighted_delta_composite_vs_baseline=bucket["weighted_delta_composite_vs_baseline"] / weight_total,
+                weighted_delta_phrase_f1_vs_baseline=bucket["weighted_delta_phrase_f1_vs_baseline"] / weight_total,
+                regression_flagged_calls=int(bucket["regression_flagged_calls"]),
+            )
+        )
+    return sorted(
+        aggregate,
+        key=lambda item: (
+            item.weighted_composite,
+            item.weighted_delta_composite_vs_baseline,
+            item.weighted_critical_phrase_f1,
+        ),
+        reverse=True,
+    )
+
+
+def write_aggregate_text_report(
+    output_path: Path,
+    manifest_path: Path,
+    call_results: list[CallEvaluationResult],
+    aggregate: list[AggregateVariantResult],
+) -> None:
+    lines: list[str] = []
+    lines.append("Post-Russian Recovery Aggregate Benchmark")
+    lines.append("")
+    lines.append(f"Manifest: {manifest_path}")
+    lines.append(f"Calls evaluated: {len(call_results)}")
+    lines.append(f"Successful calls: {sum(1 for item in call_results if not item.error)}")
+    lines.append(f"Failed calls: {sum(1 for item in call_results if item.error)}")
+    lines.append("")
+    lines.append("Aggregate variant ranking:")
+    lines.append("")
+    for index, item in enumerate(aggregate, start=1):
+        lines.append(f"{index}. {item.name}")
+        lines.append(
+            f"   weighted_composite={item.weighted_composite:.4f} "
+            f"weighted_char_ratio={item.weighted_char_ratio:.4f} "
+            f"weighted_token_f1={item.weighted_token_f1:.4f} "
+            f"weighted_critical_phrase_f1={item.weighted_critical_phrase_f1:.4f}"
+        )
+        lines.append(
+            f"   delta_composite_vs_baseline={item.weighted_delta_composite_vs_baseline:.4f} "
+            f"delta_phrase_f1_vs_baseline={item.weighted_delta_phrase_f1_vs_baseline:.4f} "
+            f"regression_flagged_calls={item.regression_flagged_calls}"
+        )
+        lines.append(f"   success_count={item.success_count} failure_count={item.failure_count}")
+        lines.append("")
+    lines.append("Per-call summary:")
+    lines.append("")
+    for call_result in call_results:
+        entry = call_result.entry
+        lines.append(f"- {entry.call_id}")
+        if call_result.error:
+            lines.append(f"  error={call_result.error}")
+            continue
+        ranked = sorted(call_result.variants, key=lambda item: item.scores.composite, reverse=True)
+        best = ranked[0]
+        baseline = next((item for item in call_result.variants if item.name == "current"), ranked[0])
+        lines.append(
+            f"  best={best.name} composite={best.scores.composite:.4f} "
+            f"baseline={baseline.scores.composite:.4f} "
+            f"delta={best.scores.composite - baseline.scores.composite:.4f}"
+        )
+        if entry.description:
+            lines.append(f"  description={entry.description}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
+def write_aggregate_json_report(
+    output_path: Path,
+    manifest_path: Path,
+    call_results: list[CallEvaluationResult],
+    aggregate: list[AggregateVariantResult],
+) -> None:
+    payload = {
+        "run_id": output_path.parent.name,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "manifest_path": str(manifest_path),
+        "calls": [
+            {
+                "call_id": item.entry.call_id,
+                "call_dir": str(item.entry.call_dir) if item.entry.call_dir else None,
+                "expected_case_path": str(item.entry.expected_case_path) if item.entry.expected_case_path else None,
+                "expected_transcript_path": str(item.entry.expected_transcript_path) if item.entry.expected_transcript_path else None,
+                "description": item.entry.description,
+                "tags": item.entry.tags or [],
+                "priority_weight": item.entry.priority_weight,
+                "error": item.error,
+                "baseline_text": item.baseline.text if item.baseline else None,
+                "expected_text": item.expected_text,
+                "variants": [
+                    {
+                        "name": result.name,
+                        "overrides": result.overrides,
+                        "elapsed_seconds": round(result.elapsed_seconds, 3),
+                        "selected_strategy": result.selected_strategy,
+                        "selected_text": result.selected_text,
+                        "scores": asdict(result.scores),
+                        "suspicious_segments": result.suspicious_segments,
+                        "suspicious_word_spans": result.suspicious_word_spans,
+                        "selected_word_spans": result.selected_word_spans,
+                        "applied_replacements": result.applied_replacements,
+                        "candidate_diagnostics": result.candidate_diagnostics,
+                        "word_span_retries": result.word_span_retries,
+                    }
+                    for result in item.variants
+                ],
+            }
+            for item in call_results
+        ],
+        "aggregate": {
+            "ranked_variants": [asdict(item) for item in aggregate],
+        },
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tune Hebrew recovery after the Russian baseline transcription stage.")
     parser.add_argument("--call-dir", type=Path, default=DEFAULT_CALL_DIR, help="Call directory that contains audio_normalized.wav or audio_original.m4a")
     parser.add_argument("--expected-file", type=Path, help="Optional file with expected transcript text; speaker/timestamp lines are stripped")
     parser.add_argument("--output", type=Path, help="Optional text report path")
     parser.add_argument("--json-output", type=Path, help="Optional JSON report path")
+    parser.add_argument("--manifest", type=Path, help="Optional evaluation manifest for multi-call offline tuning")
+    parser.add_argument("--output-dir", type=Path, help="Directory for aggregate and per-call reports in manifest mode")
+    parser.add_argument("--call-id", action="append", default=[], help="Optional call_id filter for manifest mode; repeatable")
+    parser.add_argument("--variant", action="append", default=[], help="Optional variant name filter; repeatable")
+    parser.add_argument("--max-calls", type=int, help="Optional limit on number of manifest calls to evaluate")
+    parser.add_argument("--write-per-call-reports", action="store_true", help="Write text/json reports for each call in manifest mode")
+    parser.add_argument("--baseline-only", action="store_true", help="Only evaluate the current baseline variant")
+    parser.add_argument("--compare-to", type=Path, help="Optional previous aggregate JSON report to compare manually later")
     parser.add_argument("--baseline-language", default="ru", help="Language forced for the one-time baseline transcription")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    config = AppConfig.load(ROOT / "config.yaml")
+    specs = select_variants(build_default_variants(), args.variant, args.baseline_only)
+
+    if args.manifest:
+        manifest_path = args.manifest.resolve()
+        entries = load_manifest(manifest_path, config)
+        if args.call_id:
+            allowed = set(args.call_id)
+            entries = [item for item in entries if item.call_id in allowed]
+        if args.max_calls is not None:
+            entries = entries[: max(0, args.max_calls)]
+        run_id = f"post_russian_recovery_{time.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
+        output_dir = (args.output_dir.resolve() if args.output_dir else (DEFAULT_OUTPUT_DIR / run_id))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        aggregate_text_output = output_dir / "aggregate_report.txt"
+        aggregate_json_output = output_dir / "aggregate_report.json"
+        results: list[CallEvaluationResult] = []
+        try:
+            for index, entry in enumerate(entries, start=1):
+                print(f"[{index}/{len(entries)}] Evaluating call: {entry.call_id}", flush=True)
+                result = evaluate_call(entry, config, specs, args.baseline_language)
+                results.append(result)
+                if result.error:
+                    print(f"[{index}/{len(entries)}] Failed {entry.call_id}: {result.error}", flush=True)
+                else:
+                    ranked = sorted(result.variants, key=lambda item: item.scores.composite, reverse=True)
+                    best = ranked[0]
+                    print(
+                        f"[{index}/{len(entries)}] Best for {entry.call_id}: "
+                        f"{best.name} composite={best.scores.composite:.4f} "
+                        f"token_f1={best.scores.token_f1:.4f} "
+                        f"critical_phrase_f1={best.scores.critical_phrase_f1:.4f}",
+                        flush=True,
+                    )
+                    if args.write_per_call_reports and result.baseline and result.expected_text:
+                        call_slug = f"{entry.call_id}"
+                        persist_reports(
+                            output_dir / f"{call_slug}.txt",
+                            output_dir / f"{call_slug}.json",
+                            entry.call_dir or _find_call_dir(config, entry.call_id),
+                            result.baseline,
+                            result.expected_text,
+                            result.variants,
+                        )
+                aggregate = aggregate_variant_results(results)
+                write_aggregate_text_report(aggregate_text_output, manifest_path, results, aggregate)
+                write_aggregate_json_report(aggregate_json_output, manifest_path, results, aggregate)
+        except KeyboardInterrupt:
+            aggregate = aggregate_variant_results(results)
+            write_aggregate_text_report(aggregate_text_output, manifest_path, results, aggregate)
+            write_aggregate_json_report(aggregate_json_output, manifest_path, results, aggregate)
+            print("Interrupted. Partial aggregate reports were written.", flush=True)
+            print(f"Wrote {aggregate_text_output}", flush=True)
+            print(f"Wrote {aggregate_json_output}", flush=True)
+            return 130
+        aggregate = aggregate_variant_results(results)
+        write_aggregate_text_report(aggregate_text_output, manifest_path, results, aggregate)
+        write_aggregate_json_report(aggregate_json_output, manifest_path, results, aggregate)
+        print(f"Wrote {aggregate_text_output}", flush=True)
+        print(f"Wrote {aggregate_json_output}", flush=True)
+        if aggregate:
+            best = aggregate[0]
+            print(
+                f"Best aggregate variant: {best.name} composite={best.weighted_composite:.4f} "
+                f"delta_vs_baseline={best.weighted_delta_composite_vs_baseline:.4f} "
+                f"regression_flagged_calls={best.regression_flagged_calls}",
+                flush=True,
+            )
+        if args.compare_to:
+            print(f"Previous report for manual comparison: {args.compare_to.resolve()}", flush=True)
+        return 0
+
     call_dir = args.call_dir.resolve()
     audio_path = resolve_audio_path(call_dir)
-    config = AppConfig.load(ROOT / "config.yaml")
     expected_text = expected_text_from_args(args.expected_file)
     baseline = _transcribe_local(
         audio_path,
@@ -497,7 +905,6 @@ def main() -> int:
     json_output = args.json_output or (DEFAULT_OUTPUT_DIR / f"{stem}.json")
     text_output.parent.mkdir(parents=True, exist_ok=True)
     json_output.parent.mkdir(parents=True, exist_ok=True)
-    specs = build_default_variants()
     results: list[VariantResult] = []
     print(f"Baseline ready: provider={baseline.provider} model={baseline.model} language={baseline.language}", flush=True)
     print(f"Testing {len(specs)} variants", flush=True)
