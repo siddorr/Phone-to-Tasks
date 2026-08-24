@@ -25,6 +25,13 @@ class RawSegment:
     text: str
     confidence: float | None = None
     speaker: str | None = None
+    language: str | None = None
+    language_confidence: float | None = None
+    chunk_id: str | None = None
+    chunk_start_sec: float | None = None
+    chunk_end_sec: float | None = None
+    smoothed_language: str | None = None
+    smoothed_language_reason: str | None = None
 
 
 @dataclass
@@ -35,6 +42,13 @@ class RawTranscript:
     confidence: float | None
     segments: list[RawSegment]
     text: str
+    language_distribution: dict[str, float] | None = None
+    primary_language_confidence: float | None = None
+    backend_attempted: str | None = None
+    backend_selected: str | None = None
+    backend_fallback_reason: str | None = None
+    chunked_plausibility_score: float | None = None
+    chunked_plausibility_flags: list[str] | None = None
 
 
 @dataclass
@@ -136,7 +150,9 @@ def artifact_paths(call_dir: Path) -> dict[str, Path]:
     return {
         "metadata": call_dir / "metadata.json",
         "audio_normalized": call_dir / "audio_normalized.wav",
+        "audio_chunk_manifest": call_dir / "audio_chunks_manifest.json",
         "transcript_raw": call_dir / "transcript_raw.json",
+        "transcript_vad_chunks": call_dir / "transcript_vad_chunks.json",
         "transcript_segments": call_dir / "transcript_segments.json",
         "transcript_clean": call_dir / "transcript_clean.txt",
         "summary": call_dir / "summary.json",

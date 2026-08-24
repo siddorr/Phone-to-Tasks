@@ -7,6 +7,7 @@ from pathlib import Path
 import types
 import sys
 from unittest.mock import patch, MagicMock
+from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -22,26 +23,36 @@ from call_assistant.ingest.watcher import import_file
 from call_assistant.ingest.watcher import already_imported_source_path
 from call_assistant.indexing.service import index_call
 from call_assistant.orchestrator.queue import _stale_after_seconds_for_job, claim_next_job, claim_next_job_for_call, complete_job, enqueue, is_job_stale, reset_running_jobs_on_startup
-from call_assistant.orchestrator.worker import WorkerThread, _process_diarization, _process_transcript_clean, _run_claimed_job, processing_mode, run_manual_step, run_once
+from call_assistant.orchestrator.worker import WorkerThread, _process_diarization, _process_transcript_clean, _process_transcription, _run_claimed_job, processing_mode, run_manual_step, run_once
 from call_assistant.reprocess import reset_all_calls_for_retranscription
 from call_assistant.reprocess import reset_call_for_retranscription
 from call_assistant.common.models import RawSegment, RawTranscript
 from call_assistant.transcription.service import (
     _MODEL_CACHE,
     _apply_combined_hebrew_retries,
+    assess_chunked_transcript_plausibility,
     _apply_word_span_retries,
     _build_clause_retry_candidates,
     _build_word_span_candidates,
+    _full_call_hebrew_retry_decision,
     _heuristic_word_span_semantic_validation,
     _load_local_model,
+    _maybe_run_language_retries,
     _looks_mixed_language_problem,
+    _normalize_language_label,
+    _run_post_baseline_recovery,
+    _segment_is_uncertain,
     _replace_span_in_segment_text,
     _rescue_semantic_validation_with_normalization,
     _transcribe_local,
+    _transcribe_vad_chunked,
     _transcription_preferences,
+    label_segment_languages,
+    smooth_segment_languages,
     SegmentDetectionDecision,
     ClauseRetryCandidate,
     TranscriptQualityAssessment,
+    ChunkedTranscriptPlausibility,
     WordRetryCandidate,
     WordSpanSemanticValidation,
     WordSpanDecision,
@@ -51,7 +62,8 @@ from call_assistant.transcription.service import (
     merge_transcript_candidates,
     transcribe,
 )
-from call_assistant.ui.app import _app_status_payload, _clean_transcript_preview, _clear_queue_notice, _compare_call_rows, _compact_preview, _diarization_context, _estimate_stage_runtime_seconds, _filter_calls_by_recent, _format_duration, _manual_processing_notice, _normalize_call_sort, _processing_log_preview, _set_archive_root_notice, _set_processing_mode_notice, _summary_preview
+from call_assistant.ui.app import _app_status_payload, _call_detail_refresh_payload, _clean_transcript_preview, _clear_queue_notice, _compare_call_rows, _compact_preview, _diarization_context, _estimate_stage_runtime_seconds, _filter_calls_by_recent, _format_duration, _manual_processing_notice, _normalize_call_sort, _processing_log_preview, _set_archive_root_notice, _set_processing_mode_notice, _summary_preview, _summary_sections
+from call_assistant.ui.app import create_app
 
 
 class QueueTests(unittest.TestCase):
@@ -378,6 +390,104 @@ processing:
         preview = _summary_preview({"short_summary": "This is a compact summary preview for the call detail page."})
         self.assertIn("compact summary", preview)
 
+    def test_summary_sections_normalizes_structured_summary(self) -> None:
+        sections = _summary_sections(
+            {
+                "short_summary": "  Short summary.  ",
+                "detailed_summary": " Detailed summary. ",
+                "key_points": [" One ", "", None, "Two"],
+                "decisions": [" Decide "],
+                "open_questions": [" Question? "],
+                "commitments": [" Commit "],
+                "analysis_confidence": 0.875,
+                "analysis_language": " en ",
+                "low_confidence_reason": "  note ",
+            }
+        )
+
+        self.assertEqual(sections["short_summary"], "Short summary.")
+        self.assertEqual(sections["detailed_summary"], "Detailed summary.")
+        self.assertEqual(sections["key_points"], ["One", "Two"])
+        self.assertEqual(sections["decisions"], ["Decide"])
+        self.assertEqual(sections["open_questions"], ["Question?"])
+        self.assertEqual(sections["commitments"], ["Commit"])
+        self.assertEqual(sections["analysis_confidence"], 0.875)
+        self.assertEqual(sections["analysis_confidence_display"], "0.88")
+        self.assertEqual(sections["analysis_language"], "en")
+        self.assertEqual(sections["low_confidence_reason"], "note")
+        self.assertTrue(sections["has_content"])
+
+    def test_summary_sections_handles_empty_payload(self) -> None:
+        sections = _summary_sections({})
+
+        self.assertIsNone(sections["short_summary"])
+        self.assertEqual(sections["key_points"], [])
+        self.assertIsNone(sections["analysis_confidence_display"])
+        self.assertFalse(sections["has_content"])
+
+    def test_call_detail_renders_structured_summary_instead_of_raw_json(self) -> None:
+        db = connect(self.config.sqlite_path)
+        call_id = "call_summary"
+        call_dir = self.config.archive_root / call_id
+        call_dir.mkdir(parents=True, exist_ok=True)
+        db.execute(
+            """
+            INSERT INTO calls (
+                call_id, archive_path, source_filename, source_path, sha256, imported_at,
+                duration_seconds, current_state, review_state, low_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                call_id,
+                str(call_dir),
+                "sample.wav",
+                str(self.config.incoming_folder / "sample.wav"),
+                "sha",
+                "2026-01-01T10:00:00+00:00",
+                65.0,
+                "analyzed",
+                "pending",
+                0,
+            ),
+        )
+        db.commit()
+        write_json(
+            call_dir / "summary.json",
+            {
+                "short_summary": "Short summary text.",
+                "detailed_summary": "Detailed summary text.",
+                "key_points": ["Point one", "Point two"],
+                "decisions": ["Decision one"],
+                "open_questions": ["Question one?"],
+                "commitments": ["Commitment one"],
+                "analysis_confidence": 0.9,
+                "analysis_language": "en",
+                "low_confidence_reason": "Review carefully",
+                "tasks": [{"task_id": "task_0001", "text": "Do not show here"}],
+            },
+        )
+        write_json(call_dir / "metadata.json", {"current_state": "analyzed"})
+        write_json(call_dir / "tasks.json", [])
+        write_json(call_dir / "tasks_reviewed.json", [])
+        write_json(call_dir / "processing_log.json", [])
+        write_json(call_dir / "transcript_segments.json", [])
+
+        client = TestClient(create_app(self.config))
+        response = client.get(f"/calls/{call_id}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Short summary text.", response.text)
+        self.assertIn("Detailed summary text.", response.text)
+        self.assertIn("Key Points", response.text)
+        self.assertIn("Decision one", response.text)
+        self.assertIn("Open Questions", response.text)
+        self.assertIn("Commitments", response.text)
+        self.assertIn("confidence 0.90", response.text)
+        self.assertIn("language en", response.text)
+        self.assertIn("Low-confidence note:", response.text)
+        self.assertNotIn('"short_summary": "Short summary text."', response.text)
+        self.assertNotIn("Do not show here", response.text)
+
     def test_clean_transcript_preview_uses_first_non_empty_line(self) -> None:
         preview = _clean_transcript_preview("\n\nFirst useful line\nSecond line")
         self.assertEqual(preview, "First useful line")
@@ -522,6 +632,83 @@ processing:
         self.assertEqual(payload["counts"]["running"], 0)
         self.assertEqual(payload["counts"]["queued"], 1)
         self.assertIsNone(payload["current_task"])
+
+    def test_call_detail_refresh_payload_detects_completion_and_signature_change(self) -> None:
+        db = connect(self.config.sqlite_path)
+        call_id = "call_live"
+        call_dir = self.config.archive_root / call_id
+        call_dir.mkdir(parents=True, exist_ok=True)
+        write_json(
+            call_dir / "metadata.json",
+            {
+                "call_id": call_id,
+                "current_state": "transcribing",
+                "review_state": "pending",
+            },
+        )
+        db.execute(
+            """
+            INSERT INTO calls (
+                call_id, archive_path, source_filename, source_path, sha256, imported_at,
+                current_state, review_state, low_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                call_id,
+                str(call_dir),
+                "live.wav",
+                "live.wav",
+                "sha_live",
+                "2026-01-01T00:00:00+00:00",
+                "transcribing",
+                "pending",
+                0,
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO queue_jobs (
+                job_id, call_id, stage, status, priority, attempt_count, max_attempts, available_at, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "job_live",
+                call_id,
+                "transcription",
+                "running",
+                0,
+                1,
+                2,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:05+00:00",
+            ),
+        )
+        db.commit()
+
+        running_payload = _call_detail_refresh_payload(self.config, db, call_id, call_dir)
+
+        self.assertTrue(running_payload["is_processing"])
+
+        write_json(
+            call_dir / "metadata.json",
+            {
+                "call_id": call_id,
+                "current_state": "analyzed",
+                "review_state": "pending",
+            },
+        )
+        write_json(call_dir / "summary.json", {"short_summary": "ready"})
+        db.execute(
+            "UPDATE queue_jobs SET status = 'done', finished_at = ? WHERE job_id = ?",
+            ("2026-01-01T00:01:00+00:00", "job_live"),
+        )
+        db.commit()
+
+        finished_payload = _call_detail_refresh_payload(self.config, db, call_id, call_dir)
+
+        self.assertFalse(finished_payload["is_processing"])
+        self.assertNotEqual(running_payload["signature"], finished_payload["signature"])
+        self.assertEqual(finished_payload["current_state"], "analyzed")
 
     def test_estimate_stage_runtime_seconds_uses_stage_default_without_history(self) -> None:
         db = connect(self.config.sqlite_path)
@@ -786,6 +973,338 @@ processing:
         self.assertEqual(metadata.get("current_state"), "diarized")
         self.assertEqual(metadata.get("diarization_mode"), "single_speaker_fallback")
         self.assertEqual(metadata.get("stage_outcomes", {}).get("diarization", {}).get("status"), "degraded")
+
+    def test_process_transcription_writes_vad_chunk_artifact_and_metadata(self) -> None:
+        sample = self.config.incoming_folder / "sample.wav"
+        sample.write_bytes(b"abc")
+
+        call_id = import_file(sample, self.config)
+        self.assertIsNotNone(call_id)
+
+        db = connect(self.config.sqlite_path)
+        archive_path = Path(
+            db.execute("SELECT archive_path FROM calls WHERE call_id = ?", (call_id,)).fetchone()["archive_path"]
+        )
+        write_json(archive_path / "audio_normalized.wav", {"placeholder": True})
+
+        raw = RawTranscript(
+            provider="local",
+            model="large-v3-turbo",
+            language="mixed",
+            confidence=None,
+            segments=[
+                RawSegment(
+                    start_sec=0.0,
+                    end_sec=1.0,
+                    text="שלום",
+                    confidence=None,
+                    speaker=None,
+                    language="he",
+                    chunk_id="chunk_0001",
+                    chunk_start_sec=0.0,
+                    chunk_end_sec=1.0,
+                    smoothed_language="he",
+                )
+            ],
+            text="שלום",
+        )
+
+        with (
+            patch("call_assistant.orchestrator.worker.transcribe", return_value=raw),
+            patch(
+                "call_assistant.orchestrator.worker.build_transcription_vad_chunk_artifact",
+                return_value={
+                    "backend": "whisper_legacy",
+                    "provider": "silence",
+                    "chunk_count": 1,
+                    "chunks": [{"chunk_id": "chunk_0001", "start_sec": 0.0, "end_sec": 1.0, "duration_seconds": 1.0}],
+                    "segment_language_counts": {"he": 1},
+                    "transcript_segment_count": 1,
+                },
+            ),
+        ):
+            _process_transcription(self.config, archive_path)
+
+        metadata = read_json(archive_path / "metadata.json", default={})
+        self.assertEqual(metadata.get("current_state"), "transcribed")
+        self.assertEqual(metadata.get("transcription_backend"), "whisper_legacy")
+        self.assertEqual(metadata.get("transcription_backend_selected"), "whisper_legacy")
+        self.assertEqual(metadata.get("transcription_chunk_count"), 1)
+        self.assertEqual(metadata.get("transcription_segment_language_counts"), {"he": 1})
+        self.assertEqual(metadata.get("transcription_uncertain_segment_count"), 1)
+        self.assertTrue((archive_path / "transcript_vad_chunks.json").exists())
+
+    def test_transcribe_vad_chunked_annotates_chunk_metadata(self) -> None:
+        config_path = Path(self.temp_dir.name) / "chunked_config.yaml"
+        config_path.write_text(
+            """
+paths:
+  incoming_folder: "./incoming"
+  archive_root: "./calls"
+  sqlite_path: "./index/test.db"
+  logs_dir: "./logs"
+  temp_dir: "./temp"
+processing:
+  startup_mode: "manual_step"
+transcription:
+  backend: "vad_chunked_legacy"
+  provider_default: "local"
+  chunked_plausibility_enabled: false
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        config = AppConfig.load(config_path)
+        config.ensure_directories()
+        audio_path = config.temp_dir / "audio.wav"
+        audio_path.write_bytes(b"fake")
+
+        with (
+            patch("call_assistant.transcription.service.detect_speech_chunks", return_value=[
+                types.SimpleNamespace(chunk_id="chunk_0001", start_sec=0.0, end_sec=2.0, duration_seconds=2.0),
+                types.SimpleNamespace(chunk_id="chunk_0002", start_sec=2.0, end_sec=4.0, duration_seconds=2.0),
+            ]),
+            patch("call_assistant.transcription.service._export_audio_chunk", side_effect=[config.temp_dir / "c1.wav", config.temp_dir / "c2.wav"]),
+            patch(
+                "call_assistant.transcription.service._transcribe_local_file",
+                side_effect=[
+                    RawTranscript(
+                        provider="local",
+                        model="large-v3-turbo",
+                        language="ru",
+                        confidence=None,
+                        segments=[RawSegment(start_sec=0.0, end_sec=1.0, text="Привет", confidence=None, speaker=None)],
+                        text="Привет",
+                    ),
+                    RawTranscript(
+                        provider="local",
+                        model="large-v3-turbo",
+                        language="he",
+                        confidence=None,
+                        segments=[RawSegment(start_sec=0.0, end_sec=1.0, text="שלום", confidence=None, speaker=None)],
+                        text="שלום",
+                    ),
+                ],
+            ),
+        ):
+            selected = _transcribe_vad_chunked(audio_path, config, provider="local")
+
+        self.assertEqual(selected.language, "mixed")
+        self.assertEqual(len(selected.segments), 2)
+        self.assertEqual(selected.segments[0].chunk_id, "chunk_0001")
+        self.assertEqual(selected.segments[1].chunk_id, "chunk_0002")
+        self.assertEqual(selected.segments[0].language, "ru")
+        self.assertEqual(selected.segments[1].language, "he")
+        self.assertEqual(selected.segments[1].start_sec, 2.0)
+
+    def test_transcribe_vad_chunked_uses_faster_whisper_backend_when_enabled(self) -> None:
+        config_path = Path(self.temp_dir.name) / "fw_config.yaml"
+        config_path.write_text(
+            """
+paths:
+  incoming_folder: "./incoming"
+  archive_root: "./calls"
+  sqlite_path: "./index/test.db"
+  logs_dir: "./logs"
+  temp_dir: "./temp"
+processing:
+  startup_mode: "manual_step"
+transcription:
+  backend: "faster_whisper_vad"
+  provider_default: "local"
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        config = AppConfig.load(config_path)
+        config.ensure_directories()
+        audio_path = config.temp_dir / "audio.wav"
+        audio_path.write_bytes(b"fake")
+
+        with (
+            patch("call_assistant.transcription.service.detect_speech_chunks", return_value=[
+                types.SimpleNamespace(chunk_id="chunk_0001", start_sec=0.0, end_sec=2.0, duration_seconds=2.0),
+            ]),
+            patch("call_assistant.transcription.service._export_audio_chunk", return_value=config.temp_dir / "c1.wav"),
+            patch(
+                "call_assistant.transcription.service.transcribe_faster_whisper_audio",
+                return_value=RawTranscript(
+                    provider="local",
+                    model="large-v3-turbo",
+                    language="he",
+                    confidence=0.91,
+                    segments=[RawSegment(start_sec=0.0, end_sec=1.0, text="שלום", confidence=None, speaker=None)],
+                    text="שלום",
+                ),
+            ) as backend_mock,
+        ):
+            selected = _transcribe_vad_chunked(audio_path, config, provider="local")
+
+        backend_mock.assert_called_once()
+        self.assertEqual(selected.language, "he")
+        self.assertEqual(selected.segments[0].chunk_id, "chunk_0001")
+
+    def test_assess_chunked_transcript_plausibility_flags_short_fragmented_call(self) -> None:
+        raw = RawTranscript(
+            provider="local",
+            model="large-v3-turbo",
+            language="mixed",
+            confidence=None,
+            segments=[
+                RawSegment(start_sec=0.0, end_sec=0.8, text="감사합니다", confidence=-0.5, speaker=None, language="ko", smoothed_language="ko"),
+                RawSegment(start_sec=0.8, end_sec=1.6, text="Thank you", confidence=-0.5, speaker=None, language="en", smoothed_language="en"),
+                RawSegment(start_sec=1.6, end_sec=2.5, text="Что это", confidence=-0.5, speaker=None, language="ru", smoothed_language="ru"),
+                RawSegment(start_sec=2.5, end_sec=3.2, text="Yeah", confidence=-0.5, speaker=None, language="en", smoothed_language="en"),
+            ],
+            text="감사합니다 Thank you Что это Yeah",
+        )
+        chunks = [
+            types.SimpleNamespace(chunk_id="chunk_1", start_sec=0.0, end_sec=0.8, duration_seconds=0.8),
+            types.SimpleNamespace(chunk_id="chunk_2", start_sec=0.8, end_sec=1.6, duration_seconds=0.8),
+            types.SimpleNamespace(chunk_id="chunk_3", start_sec=1.6, end_sec=2.5, duration_seconds=0.9),
+            types.SimpleNamespace(chunk_id="chunk_4", start_sec=2.5, end_sec=3.2, duration_seconds=0.7),
+        ]
+
+        plausibility = assess_chunked_transcript_plausibility(raw, chunks, self.config)
+
+        self.assertTrue(plausibility.should_fallback)
+        self.assertIn("short_call_many_languages", plausibility.flags)
+        self.assertIn("rapid_language_switching", plausibility.flags)
+
+    def test_transcribe_vad_chunked_falls_back_to_legacy_when_implausible(self) -> None:
+        config_path = Path(self.temp_dir.name) / "chunked_fallback_config.yaml"
+        config_path.write_text(
+            """
+paths:
+  incoming_folder: "./incoming"
+  archive_root: "./calls"
+  sqlite_path: "./index/test.db"
+  logs_dir: "./logs"
+  temp_dir: "./temp"
+processing:
+  startup_mode: "manual_step"
+transcription:
+  backend: "faster_whisper_vad"
+  fallback_backend: "whisper_legacy"
+  provider_default: "local"
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        config = AppConfig.load(config_path)
+        config.ensure_directories()
+        audio_path = config.temp_dir / "audio.wav"
+        audio_path.write_bytes(b"fake")
+        fallback = RawTranscript(
+            provider="local",
+            model="large-v3-turbo",
+            language="ru",
+            confidence=None,
+            segments=[RawSegment(start_sec=0.0, end_sec=3.0, text="Алло שלום", confidence=None, speaker=None, language="mixed", smoothed_language="mixed")],
+            text="Алло שלום",
+            backend_attempted="whisper_legacy",
+            backend_selected="whisper_legacy",
+        )
+
+        with (
+            patch("call_assistant.transcription.service.detect_speech_chunks", return_value=[
+                types.SimpleNamespace(chunk_id="chunk_0001", start_sec=0.0, end_sec=0.7, duration_seconds=0.7),
+                types.SimpleNamespace(chunk_id="chunk_0002", start_sec=0.7, end_sec=1.4, duration_seconds=0.7),
+                types.SimpleNamespace(chunk_id="chunk_0003", start_sec=1.4, end_sec=2.1, duration_seconds=0.7),
+            ]),
+            patch("call_assistant.transcription.service._export_audio_chunk", side_effect=[config.temp_dir / "c1.wav", config.temp_dir / "c2.wav", config.temp_dir / "c3.wav"]),
+            patch(
+                "call_assistant.transcription.service.transcribe_faster_whisper_audio",
+                side_effect=[
+                    RawTranscript(provider="local", model="large-v3-turbo", language="ru", confidence=0.9, segments=[RawSegment(start_sec=0.0, end_sec=0.7, text="Субтитры сделал", speaker=None)], text="Субтитры сделал"),
+                    RawTranscript(provider="local", model="large-v3-turbo", language="ru", confidence=0.9, segments=[RawSegment(start_sec=0.0, end_sec=0.7, text="Продолжение следует", speaker=None)], text="Продолжение следует"),
+                    RawTranscript(provider="local", model="large-v3-turbo", language="ru", confidence=0.9, segments=[RawSegment(start_sec=0.0, end_sec=0.7, text="Продолжение следует", speaker=None)], text="Продолжение следует"),
+                ],
+            ),
+            patch("call_assistant.transcription.service._transcribe_local_file", return_value=fallback) as fallback_mock,
+        ):
+            selected = _transcribe_vad_chunked(audio_path, config, provider="local")
+
+        fallback_mock.assert_called_once()
+        self.assertEqual(selected.backend_attempted, "faster_whisper_vad")
+        self.assertEqual(selected.backend_selected, "whisper_legacy")
+        self.assertIsNotNone(selected.backend_fallback_reason)
+        self.assertTrue(selected.chunked_plausibility_flags)
+
+    def test_label_segment_languages_detects_mixed_transliteration(self) -> None:
+        raw = RawTranscript(
+            provider="local",
+            model="large-v3-turbo",
+            language="ru",
+            confidence=None,
+            segments=[
+                RawSegment(start_sec=0.0, end_sec=3.0, text="И там это не такцив Мульбецоа.", confidence=None, speaker=None),
+                RawSegment(start_sec=3.0, end_sec=5.0, text="שלום עולם", confidence=None, speaker=None),
+            ],
+            text="И там это не такцив Мульбецоа. שלום עולם",
+        )
+
+        labeled = label_segment_languages(raw, self.config)
+
+        self.assertEqual(labeled.segments[0].language, "mixed")
+        self.assertEqual(labeled.segments[1].language, "he")
+        self.assertTrue(_segment_is_uncertain(labeled.segments[0]))
+
+    def test_normalize_language_label_clamps_to_supported_set(self) -> None:
+        normalized, reason = _normalize_language_label("ko", "감사합니다", None)
+        self.assertEqual(normalized, "unknown")
+        self.assertEqual(reason, "unsupported_label_unknown")
+
+        normalized, reason = _normalize_language_label("iw", "שלום", None)
+        self.assertEqual(normalized, "he")
+        self.assertEqual(reason, "allowed_label")
+
+    def test_label_segment_languages_normalizes_unsupported_segment_language(self) -> None:
+        raw = RawTranscript(
+            provider="local",
+            model="large-v3-turbo",
+            language="ko",
+            confidence=None,
+            segments=[
+                RawSegment(
+                    start_sec=0.0,
+                    end_sec=1.0,
+                    text="감사합니다",
+                    confidence=None,
+                    speaker=None,
+                    language="ko",
+                    smoothed_language="ko",
+                )
+            ],
+            text="감사합니다",
+        )
+
+        labeled = label_segment_languages(raw, self.config)
+
+        self.assertEqual(labeled.language, "unknown")
+        self.assertEqual(labeled.segments[0].language, "unknown")
+        self.assertEqual(labeled.segments[0].smoothed_language, "unknown")
+        self.assertTrue(labeled.segments[0].smoothed_language_reason.startswith("unsupported_label_"))
+        self.assertTrue(_segment_is_uncertain(labeled.segments[0]))
+
+    def test_smooth_segment_languages_prefers_neighbor_consensus(self) -> None:
+        raw = RawTranscript(
+            provider="local",
+            model="large-v3-turbo",
+            language="ru",
+            confidence=None,
+            segments=[
+                RawSegment(start_sec=0.0, end_sec=4.0, text="Привет как дела", confidence=None, speaker=None, language="ru", language_confidence=0.9, smoothed_language="ru"),
+                RawSegment(start_sec=4.0, end_sec=5.0, text="такцив", confidence=None, speaker=None, language="mixed", language_confidence=0.4, smoothed_language="mixed"),
+                RawSegment(start_sec=5.0, end_sec=9.0, text="Все нормально", confidence=None, speaker=None, language="ru", language_confidence=0.9, smoothed_language="ru"),
+            ],
+            text="Привет как дела такцив Все нормально",
+        )
+
+        smoothed = smooth_segment_languages(raw, self.config)
+
+        self.assertEqual(smoothed.segments[1].smoothed_language, "ru")
+        self.assertEqual(smoothed.segments[1].smoothed_language_reason, "neighbor_smoothing")
 
     def test_run_claimed_job_clears_stale_errors_after_success(self) -> None:
         sample = self.config.incoming_folder / "sample.wav"
@@ -1067,12 +1586,14 @@ class CallsPageTests(unittest.TestCase):
         summary: str,
         task_count: int = 0,
         state: str = "indexed",
+        duration_seconds: float | None = None,
     ) -> dict:
         return {
             "call_id": call_id,
             "recorded_at": recorded_at.isoformat(),
             "imported_at": recorded_at.isoformat(),
             "display_recorded_at": recorded_at.isoformat(),
+            "duration_seconds": duration_seconds,
             "display_respondent": respondent,
             "current_state": state,
             "display_task_count": task_count,
@@ -1099,9 +1620,29 @@ class CallsPageTests(unittest.TestCase):
 
         self.assertEqual([item["call_id"] for item in filtered], ["recent_call"])
 
+    def test_calls_page_sorts_by_duration_descending(self) -> None:
+        now = datetime.now(timezone.utc)
+        short_call = self._call(
+            call_id="call_short",
+            respondent="Aaron",
+            recorded_at=now - timedelta(hours=1),
+            summary="Short",
+            duration_seconds=65,
+        )
+        long_call = self._call(
+            call_id="call_long",
+            respondent="Bella",
+            recorded_at=now - timedelta(hours=2),
+            summary="Long",
+            duration_seconds=360,
+        )
+
+        self.assertLess(_compare_call_rows(long_call, short_call, "duration", "desc"), 0)
+
     def test_calls_page_exact_date_overrides_recent_filter(self) -> None:
         self.assertEqual(_normalize_call_sort("invalid", "invalid"), ("recorded_at", "desc"))
         self.assertEqual(_normalize_call_sort("tasks", "invalid"), ("tasks", "desc"))
+        self.assertEqual(_normalize_call_sort("duration", "invalid"), ("duration", "desc"))
 
     def test_format_duration(self) -> None:
         self.assertEqual(_format_duration(None), "-")
@@ -1223,6 +1764,93 @@ paths:
         self.assertIn("suspected_hebrew_transliteration", assessment.flags)
         self.assertGreaterEqual(assessment.suspicious_token_count, 3)
         self.assertTrue(assessment.suspicious_token_examples)
+        temp_dir.cleanup()
+
+    def test_quality_assessment_skips_redundant_llm_without_runtime_config(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        root = Path(temp_dir.name)
+        config_path = root / "config.yaml"
+        config_path.write_text(
+            """
+paths:
+  incoming_folder: "./incoming"
+  archive_root: "./calls"
+  sqlite_path: "./index/test.db"
+  logs_dir: "./logs"
+  temp_dir: "./temp"
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        config = AppConfig.load(config_path)
+        config.ensure_directories()
+        audio_path = config.temp_dir / "sample.wav"
+        audio_path.write_bytes(b"abc")
+        write_json(audio_path.parent / "metadata.json", {"duration_seconds": 12})
+
+        raw = RawTranscript(
+            provider="cloud",
+            model="whisper-1",
+            language="unknown",
+            confidence=None,
+            segments=[RawSegment(start_sec=0.0, end_sec=11.0, text="감사합니다", confidence=None, speaker=None)],
+            text="감사합니다",
+        )
+
+        with patch("call_assistant.transcription.service._run_redundant_quality_llm") as llm_mock:
+            assessment = assess_transcript_quality(raw, audio_path)
+
+        llm_mock.assert_not_called()
+        self.assertIsNone(assessment.llm_score)
+        self.assertEqual(assessment.llm_flags, [])
+        self.assertIsNone(assessment.llm_reason)
+        temp_dir.cleanup()
+
+    def test_quality_assessment_combines_redundant_llm_score_when_enabled(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        root = Path(temp_dir.name)
+        config_path = root / "config.yaml"
+        config_path.write_text(
+            """
+paths:
+  incoming_folder: "./incoming"
+  archive_root: "./calls"
+  sqlite_path: "./index/test.db"
+  logs_dir: "./logs"
+  temp_dir: "./temp"
+transcription:
+  quality_redundant_llm_enabled: true
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        config = AppConfig.load(config_path)
+        config.ensure_directories()
+        audio_path = config.temp_dir / "sample.wav"
+        audio_path.write_bytes(b"abc")
+        write_json(audio_path.parent / "metadata.json", {"duration_seconds": 12})
+
+        raw = RawTranscript(
+            provider="cloud",
+            model="whisper-1",
+            language="unknown",
+            confidence=None,
+            segments=[RawSegment(start_sec=0.0, end_sec=11.0, text="감사합니다", confidence=None, speaker=None)],
+            text="감사합니다",
+        )
+
+        with patch(
+            "call_assistant.transcription.service._run_redundant_quality_llm",
+            return_value=(0.18, ["wrong_language_gibberish"], "unsupported Hangul for allowed language set"),
+        ) as llm_mock:
+            assessment = assess_transcript_quality(raw, audio_path, config=config)
+
+        llm_mock.assert_called_once()
+        self.assertGreater(assessment.heuristic_score, assessment.llm_score)
+        self.assertEqual(assessment.llm_score, 0.18)
+        self.assertEqual(assessment.score, 0.18)
+        self.assertIn("wrong_language_gibberish", assessment.flags)
+        self.assertEqual(assessment.llm_reason, "unsupported Hangul for allowed language set")
         temp_dir.cleanup()
 
     def test_quality_assessment_detects_dense_cyrillic_hebrew_transliteration(self) -> None:
@@ -1931,6 +2559,60 @@ segment_detection:
         self.assertEqual(artifact["selection"]["retried_languages"], ["he"])
         temp_dir.cleanup()
 
+    def test_language_retry_skips_next_forced_language_for_stable_hebrew_transcript(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        root = Path(temp_dir.name)
+        config_path = root / "config.yaml"
+        config_path.write_text(
+            """
+paths:
+  incoming_folder: "./incoming"
+  archive_root: "./calls"
+  sqlite_path: "./index/test.db"
+  logs_dir: "./logs"
+  temp_dir: "./temp"
+transcription:
+  language_retry_enabled: true
+  language_retry_order: ["he", "ru"]
+  language_retry_confidence_threshold: 0.6
+  language_retry_uncertain_segment_ratio: 0.5
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        config = AppConfig.load(config_path)
+        config.ensure_directories()
+        audio_path = config.temp_dir / "sample.wav"
+        audio_path.write_bytes(b"abc")
+
+        transcript = RawTranscript(
+            provider="local",
+            model="large-v3-turbo",
+            language="he",
+            confidence=None,
+            segments=[
+                RawSegment(start_sec=0.0, end_sec=1.0, text="שלום", confidence=None, speaker=None, language="he", language_confidence=0.35),
+                RawSegment(start_sec=1.0, end_sec=2.0, text="תודה", confidence=None, speaker=None, language="he", language_confidence=0.35),
+            ],
+            text="שלום תודה",
+        )
+        transcript.primary_language_confidence = 0.92
+        transcript.language_distribution = {"he": 1.0}
+
+        with patch("call_assistant.transcription.service._transcribe_force_language") as retry_mock:
+            selected = _maybe_run_language_retries(
+                transcript,
+                audio_path,
+                config,
+                provider="local",
+                model_override=None,
+                language_mode="auto",
+            )
+
+        retry_mock.assert_not_called()
+        self.assertEqual(selected.language, "he")
+        temp_dir.cleanup()
+
     def test_build_word_span_candidates_includes_split_phrase(self) -> None:
         temp_dir = tempfile.TemporaryDirectory()
         root = Path(temp_dir.name)
@@ -2040,6 +2722,110 @@ segment_detection:
         self.assertEqual(len(candidates), 1)
         self.assertIn("атомали", candidates[0].clause_text.lower())
         self.assertIn("такцив", candidates[0].clause_text.lower())
+        temp_dir.cleanup()
+
+    def test_build_clause_retry_candidates_prefers_budget_combo_over_weaker_clause(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        root = Path(temp_dir.name)
+        config_path = root / "config.yaml"
+        config_path.write_text(
+            """
+paths:
+  incoming_folder: "./incoming"
+  archive_root: "./calls"
+  sqlite_path: "./index/test.db"
+  logs_dir: "./logs"
+  temp_dir: "./temp"
+segment_detection:
+  enabled: true
+  run_on_every_call: true
+  clause_retry_enabled: true
+  clause_retry_min_span_words: 4
+  clause_retry_max_span_words: 8
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        config = AppConfig.load(config_path)
+        config.ensure_directories()
+        raw = RawTranscript(
+            provider="local",
+            model="large-v3-turbo",
+            language="ru",
+            confidence=None,
+            segments=[
+                RawSegment(
+                    start_sec=0.0,
+                    end_sec=7.0,
+                    text="и потом его атомали, такцив капсулы 250 а потом просто сказали привет",
+                    confidence=None,
+                    speaker=None,
+                )
+            ],
+            text="и потом его атомали, такцив капсулы 250 а потом просто сказали привет",
+        )
+        decisions = [
+            SegmentDetectionDecision(
+                segment_index=0,
+                label="hebrew_transliteration",
+                confidence=0.9,
+                reason="Budgeting clause.",
+                suspicious=True,
+                retry_language="he",
+            )
+        ]
+
+        candidates = _build_clause_retry_candidates(raw, decisions, config)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("атомали", candidates[0].clause_text.lower())
+        self.assertIn("такцив", candidates[0].clause_text.lower())
+        self.assertNotIn("привет", candidates[0].clause_text.lower())
+        temp_dir.cleanup()
+
+    def test_full_call_hebrew_retry_decision_surfaces_threshold_reasons(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        root = Path(temp_dir.name)
+        config_path = root / "config.yaml"
+        config_path.write_text(
+            """
+paths:
+  incoming_folder: "./incoming"
+  archive_root: "./calls"
+  sqlite_path: "./index/test.db"
+  logs_dir: "./logs"
+  temp_dir: "./temp"
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        config = AppConfig.load(config_path)
+        decision = _full_call_hebrew_retry_decision(
+            TranscriptQualityAssessment(
+                score=0.32,
+                flags=["suspected_hebrew_transliteration"],
+                suspect_language_confusion=True,
+                suggested_retry_languages=["he"],
+                suspicious_token_count=5,
+                suspicious_token_examples=["баруха", "шэм"],
+                suspicious_segment_count=3,
+                suspicious_segment_examples=["баруха шэм", "юм то"],
+                low_confidence_reason="suspected_hebrew_transliteration",
+            ),
+            [
+                SegmentDetectionDecision(0, "hebrew_transliteration", 0.9, "r1", True, "he"),
+                SegmentDetectionDecision(1, "hebrew_transliteration", 0.9, "r2", True, "he"),
+                SegmentDetectionDecision(2, "hebrew_transliteration", 0.9, "r3", True, "he"),
+                SegmentDetectionDecision(3, "russian_normal", 0.9, "r4", False, None),
+            ],
+            [],
+            [],
+            config,
+        )
+
+        self.assertTrue(decision["should_retry"])
+        self.assertIn("low_baseline_score", decision["reasons"])
+        self.assertIn("high_suspicious_segment_ratio", decision["reasons"])
         temp_dir.cleanup()
 
     def test_replace_span_in_segment_text_preserves_surrounding_russian(self) -> None:
@@ -2444,6 +3230,53 @@ paths:
         self.assertEqual(comparison.strategy, "merged_segments")
         self.assertEqual(comparison.selected.segments[0].text, "Алё, жора")
         self.assertEqual(comparison.selected.segments[1].text, "הייתה לי שיחה כזאת")
+        temp_dir.cleanup()
+
+    def test_compare_transcript_candidates_logs_candidate_previews(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        root = Path(temp_dir.name)
+        config_path = root / "config.yaml"
+        config_path.write_text(
+            """
+paths:
+  incoming_folder: "./incoming"
+  archive_root: "./calls"
+  sqlite_path: "./index/test.db"
+  logs_dir: "./logs"
+  temp_dir: "./temp"
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        config = AppConfig.load(config_path)
+        config.ensure_directories()
+        audio_path = config.temp_dir / "sample.wav"
+        audio_path.write_bytes(b"abc")
+        write_json(audio_path.parent / "metadata.json", {"duration_seconds": 30})
+
+        baseline = RawTranscript(
+            provider="local",
+            model="large-v3-turbo",
+            language="unknown",
+            confidence=None,
+            segments=[RawSegment(start_sec=0.0, end_sec=5.0, text="감사합니다", confidence=None, speaker=None)],
+            text="감사합니다",
+        )
+        forced_hebrew = RawTranscript(
+            provider="local",
+            model="large-v3-turbo",
+            language="he",
+            confidence=None,
+            segments=[RawSegment(start_sec=0.0, end_sec=5.0, text="שלום לכם", confidence=None, speaker=None)],
+            text="שלום לכם",
+        )
+
+        with self.assertLogs("call_assistant.transcription.service", level="INFO") as captured:
+            compare_transcript_candidates(baseline, forced_hebrew, audio_path, merge_enabled=False)
+
+        joined = "\n".join(captured.output)
+        self.assertIn("baseline_preview=감사합니다", joined)
+        self.assertIn("forced_preview=שלום לכם", joined)
         temp_dir.cleanup()
 
 

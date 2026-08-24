@@ -9,6 +9,7 @@ description = "Local-first call processing pipeline for transcripts, summaries, 
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.110.0",
+  "faster-whisper",
   "jinja2>=3.1.0",
   "openai>=1.0.0",
   "openai-whisper",
