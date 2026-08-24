@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from pathlib import Path
+from shutil import copyfile
 
 from call_assistant.analysis.service import analyze_call
 from call_assistant.audio.normalize import normalize_audio
@@ -18,7 +19,9 @@ from call_assistant.speaker_identity.service import run_speaker_identity_stage
 from call_assistant.transcript_cleaner.service import clean_transcript
 from call_assistant.transcription.service import (
     _looks_mixed_language_problem,
+    _segment_is_uncertain,
     _transcription_preferences,
+    build_transcription_vad_chunk_artifact,
     load_transcription_candidate_selection,
     transcribe,
 )
@@ -106,13 +109,34 @@ def _require_artifact(path: Path, stage: str) -> None:
 def _process_audio_prepare(config: AppConfig, call_dir: Path) -> None:
     original_audio = next(path for path in call_dir.iterdir() if path.name.startswith("audio_original"))
     logger.info("Stage audio_prepare start call_dir=%s source=%s", call_dir, original_audio.name)
-    audio_metadata = normalize_audio(original_audio, call_dir / "audio_normalized.wav")
+    processing_subdir = Path(config.section("audio_processing").get("temp_subdir", "./audio_processing"))
+    processing_dir = call_dir / processing_subdir
+    normalized_dest = processing_dir / "audio_normalized.wav"
+    audio_metadata, chunk_info = normalize_audio(original_audio, normalized_dest, config)
+    copyfile(normalized_dest, call_dir / "audio_normalized.wav")
     metadata = _update_metadata(
         call_dir,
         current_state="audio_prepared",
         audio_format=audio_metadata.audio_format,
         duration_seconds=audio_metadata.duration_seconds,
+        audio_chunk_count=len(chunk_info),
+        audio_chunks_available=bool(chunk_info),
     )
+    if chunk_info:
+        manifest_entries: list[dict] = []
+        for entry in chunk_info:
+            chunk_path = Path(entry["path"])
+            relative_path = str(chunk_path.relative_to(call_dir))
+            manifest_entries.append(
+                {
+                    "chunk_id": entry["chunk_id"],
+                    "path": relative_path,
+                    "start_sec": entry["start_sec"],
+                    "end_sec": entry["end_sec"],
+                    "duration_seconds": entry["duration_seconds"],
+                }
+            )
+        write_json(call_dir / CHUNK_MANIFEST_FILENAME, manifest_entries)
     _record_stage_outcome(call_dir, "audio_prepare", "success", "Audio normalization completed")
     _sync_call_row(config, call_dir)
     logger.info("Stage audio_prepare success call_dir=%s duration_seconds=%s format=%s", call_dir, audio_metadata.duration_seconds, audio_metadata.audio_format)
@@ -125,6 +149,8 @@ def _process_transcription(config: AppConfig, call_dir: Path) -> None:
     default_provider, model_override, language_override, language_mode = _transcription_preferences(audio_path, config)
     raw = transcribe(audio_path, config)
     write_json(call_dir / "transcript_raw.json", raw)
+    vad_chunk_artifact = build_transcription_vad_chunk_artifact(audio_path, raw, config)
+    write_json(call_dir / "transcript_vad_chunks.json", vad_chunk_artifact)
     candidate_selection = load_transcription_candidate_selection(call_dir)
     selection = candidate_selection.get("selection", {})
     segment_detection = candidate_selection.get("segment_detection", {})
@@ -141,6 +167,16 @@ def _process_transcription(config: AppConfig, call_dir: Path) -> None:
         low_confidence=low_confidence,
         transcription_provider=raw.provider,
         transcription_model=raw.model,
+        transcription_backend=raw.backend_selected or raw.backend_attempted or config.section("transcription").get("backend", "whisper_legacy"),
+        transcription_backend_attempted=raw.backend_attempted or config.section("transcription").get("backend", "whisper_legacy"),
+        transcription_backend_selected=raw.backend_selected or raw.backend_attempted or config.section("transcription").get("backend", "whisper_legacy"),
+        transcription_backend_fallback_reason=raw.backend_fallback_reason,
+        transcription_chunk_count=vad_chunk_artifact.get("chunk_count"),
+        transcription_segment_language_counts=vad_chunk_artifact.get("segment_language_counts", {}),
+        transcription_language_smoothing_applied=bool(config.section("transcription").get("language_smoothing_enabled", True)),
+        transcription_uncertain_segment_count=sum(1 for item in raw.segments if _segment_is_uncertain(item)),
+        transcription_chunked_plausibility_score=raw.chunked_plausibility_score,
+        transcription_chunked_plausibility_flags=raw.chunked_plausibility_flags or [],
         transcription_language_detected=raw.language,
         transcription_language_override=language_override,
         transcription_language_mode=language_mode,
@@ -217,6 +253,13 @@ def transcribe_data_to_segments(
         language=raw_payload.get("language", "unknown"),
         confidence=raw_payload.get("confidence"),
         text=raw_payload.get("text", ""),
+        language_distribution=raw_payload.get("language_distribution"),
+        primary_language_confidence=raw_payload.get("primary_language_confidence"),
+        backend_attempted=raw_payload.get("backend_attempted"),
+        backend_selected=raw_payload.get("backend_selected"),
+        backend_fallback_reason=raw_payload.get("backend_fallback_reason"),
+        chunked_plausibility_score=raw_payload.get("chunked_plausibility_score"),
+        chunked_plausibility_flags=raw_payload.get("chunked_plausibility_flags"),
         segments=[
             RawSegment(
                 start_sec=float(item.get("start_sec", item.get("start", 0.0))),
@@ -224,6 +267,13 @@ def transcribe_data_to_segments(
                 text=item.get("text", ""),
                 confidence=item.get("confidence"),
                 speaker=item.get("speaker"),
+                language=item.get("language"),
+                language_confidence=item.get("language_confidence"),
+                chunk_id=item.get("chunk_id"),
+                chunk_start_sec=item.get("chunk_start_sec"),
+                chunk_end_sec=item.get("chunk_end_sec"),
+                smoothed_language=item.get("smoothed_language"),
+                smoothed_language_reason=item.get("smoothed_language_reason"),
             )
             for item in raw_payload.get("segments", [])
         ],
@@ -473,3 +523,4 @@ class WorkerThread:
 
             sleep_for = max(0.2, min(1.0, next_scan_at - time.monotonic()))
             self._stop.wait(sleep_for)
+CHUNK_MANIFEST_FILENAME = "audio_chunks_manifest.json"

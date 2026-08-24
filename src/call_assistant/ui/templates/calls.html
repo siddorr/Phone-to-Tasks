@@ -14,6 +14,8 @@
       .notice { padding: 0.8rem 1rem; background: var(--notice-bg); border: 1px solid var(--notice-border); margin-bottom: 1rem; }
       form { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr auto auto; gap: 0.75rem; margin-bottom: 1rem; }
       .upload-form { grid-template-columns: 1fr auto; align-items: center; background: var(--panel-bg); padding: 1rem; border: 1px solid var(--border-color); }
+      .upload-form__field { display: grid; gap: 0.35rem; }
+      .upload-form__hint { font-size: 0.9rem; color: var(--muted-text); }
       .settings-form { grid-template-columns: 1fr auto; align-items: center; background: var(--panel-bg); padding: 1rem; border: 1px solid var(--border-color); }
       .settings-label { font-size: 0.92rem; color: var(--muted-text); margin-bottom: 0.35rem; display: block; }
       input, button, select { padding: 0.55rem; border: 1px solid var(--control-border); background: var(--control-bg); color: var(--text-color); border-radius: 0.45rem; }
@@ -47,7 +49,10 @@
       <button type="submit">Save Calls Folder</button>
     </form>
     <form method="post" action="/upload-audio" enctype="multipart/form-data" class="upload-form">
-      <input type="file" name="audio_file" accept=".wav,.mp3,.m4a,.aac,.flac,.ogg,.wma" required>
+      <div class="upload-form__field">
+        <input type="file" name="audio_file" accept=".wav,.mp3,.m4a,.aac,.flac,.ogg,.wma" multiple required>
+        <div class="upload-form__hint">You can select several audio files in one upload.</div>
+      </div>
       <button type="submit">Upload Audio</button>
     </form>
     <form method="get" action="/calls">
@@ -69,7 +74,7 @@
         <tr>
           <th><a href="{{ sort_links['recorded_at'] }}">Recorded Date/Time {% if sort_by == "recorded_at" %}{{ "↑" if sort_dir == "asc" else "↓" }}{% endif %}</a></th>
           <th>Call ID</th>
-          <th>Duration</th>
+          <th><a href="{{ sort_links['duration'] }}">Duration {% if sort_by == "duration" %}{{ "↑" if sort_dir == "asc" else "↓" }}{% endif %}</a></th>
           <th><a href="{{ sort_links['respondent'] }}">Respondent {% if sort_by == "respondent" %}{{ "↑" if sort_dir == "asc" else "↓" }}{% endif %}</a></th>
           <th><a href="{{ sort_links['state'] }}">State {% if sort_by == "state" %}{{ "↑" if sort_dir == "asc" else "↓" }}{% endif %}</a></th>
           <th><a href="{{ sort_links['tasks'] }}">Tasks {% if sort_by == "tasks" %}{{ "↑" if sort_dir == "asc" else "↓" }}{% endif %}</a></th>

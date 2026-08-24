@@ -38,9 +38,23 @@
       .compact-pre { margin: 0; max-height: 320px; overflow: auto; background: var(--panel-soft-bg); border: 1px solid var(--soft-border-color); padding: 0.75rem; }
       .compact-grid { display: grid; gap: 0.4rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
       .summary-note { color: var(--muted-text); font-size: 0.94rem; }
+      .summary-structured { display: grid; gap: 0.85rem; }
+      .summary-meta { display: flex; gap: 0.45rem; flex-wrap: wrap; align-items: center; }
+      .summary-lead { margin: 0; font-size: 1.03rem; line-height: 1.45; }
+      .summary-detail { margin: 0; line-height: 1.55; color: var(--text-color); }
+      .summary-section { display: grid; gap: 0.45rem; }
+      .summary-section h3 { margin: 0; font-size: 0.98rem; }
+      .summary-list { margin: 0; padding-left: 1.15rem; display: grid; gap: 0.35rem; }
+      .summary-warning { padding: 0.75rem 0.85rem; border: 1px solid var(--notice-border); background: var(--notice-bg); color: var(--warning-text); border-radius: 0.45rem; }
+      .summary-empty { color: var(--muted-text); }
     </style>
   </head>
-  <body>
+  <body
+    data-call-live-url="/calls/{{ call.call_id }}/live-status"
+    data-call-live-signature="{{ call_live_refresh.signature }}"
+    data-call-live-processing="{{ 'true' if call_live_refresh.is_processing else 'false' }}"
+    data-call-live-poll-interval="{{ call_live_refresh.poll_interval_seconds }}"
+  >
     <p><a href="/calls">Back to calls</a> | <a href="/queue">Queue</a> | <a href="/speakers">Speakers</a></p>
     <h1>{{ call.call_id }}</h1>
     {% if notice %}
@@ -122,6 +136,9 @@
     <section>
       <h2>Transcription Quality</h2>
       <div class="status-badges">
+        {% if transcription_backend_selected %}
+        <span class="badge">backend {{ transcription_backend_selected }}</span>
+        {% endif %}
         {% if transcription_language_detected %}
         <span class="badge">detected {{ transcription_language_detected }}</span>
         {% endif %}
@@ -134,6 +151,24 @@
       </div>
       {% if transcription_retried_languages %}
       <div><strong>Retried languages:</strong> {{ transcription_retried_languages | join(", ") }}</div>
+      {% endif %}
+      {% if transcription_backend_attempted %}
+      <div><strong>Backend attempted:</strong> {{ transcription_backend_attempted }}</div>
+      {% endif %}
+      {% if transcription_backend_fallback_reason %}
+      <div><strong>Fallback reason:</strong> {{ transcription_backend_fallback_reason }}</div>
+      {% endif %}
+      {% if transcription_chunk_count is not none %}
+      <div><strong>Chunk count:</strong> {{ transcription_chunk_count }}</div>
+      {% endif %}
+      {% if transcription_uncertain_segment_count is not none %}
+      <div><strong>Uncertain segments:</strong> {{ transcription_uncertain_segment_count }}</div>
+      {% endif %}
+      {% if transcription_chunked_plausibility_score is not none %}
+      <div><strong>Chunked plausibility:</strong> {{ "%.2f"|format(transcription_chunked_plausibility_score) }}</div>
+      {% endif %}
+      {% if transcription_chunked_plausibility_flags %}
+      <div><strong>Chunked plausibility flags:</strong> {{ transcription_chunked_plausibility_flags | join(", ") }}</div>
       {% endif %}
       {% if transcription_quality_flags %}
       <div><strong>Quality flags:</strong> {{ transcription_quality_flags | join(", ") }}</div>
@@ -166,7 +201,73 @@
             <span class="collapsible__meta">{{ summary_preview }}</span>
           </summary>
           <div class="collapsible__body">
-            <pre class="compact-pre">{{ summary | tojson(indent=2) }}</pre>
+            <div class="summary-structured">
+              {% if summary_sections.analysis_confidence_display or summary_sections.analysis_language or summary_sections.low_confidence_reason %}
+              <div class="summary-meta">
+                {% if summary_sections.analysis_confidence_display %}
+                <span class="badge">confidence {{ summary_sections.analysis_confidence_display }}</span>
+                {% endif %}
+                {% if summary_sections.analysis_language %}
+                <span class="badge">language {{ summary_sections.analysis_language }}</span>
+                {% endif %}
+                {% if summary_sections.low_confidence_reason %}
+                <span class="badge">low confidence</span>
+                {% endif %}
+              </div>
+              {% endif %}
+              {% if summary_sections.short_summary %}
+              <p class="summary-lead">{{ summary_sections.short_summary }}</p>
+              {% endif %}
+              {% if summary_sections.detailed_summary %}
+              <p class="summary-detail">{{ summary_sections.detailed_summary }}</p>
+              {% endif %}
+              {% if summary_sections.key_points %}
+              <div class="summary-section">
+                <h3>Key Points</h3>
+                <ul class="summary-list">
+                  {% for item in summary_sections.key_points %}
+                  <li>{{ item }}</li>
+                  {% endfor %}
+                </ul>
+              </div>
+              {% endif %}
+              {% if summary_sections.decisions %}
+              <div class="summary-section">
+                <h3>Decisions</h3>
+                <ul class="summary-list">
+                  {% for item in summary_sections.decisions %}
+                  <li>{{ item }}</li>
+                  {% endfor %}
+                </ul>
+              </div>
+              {% endif %}
+              {% if summary_sections.open_questions %}
+              <div class="summary-section">
+                <h3>Open Questions</h3>
+                <ul class="summary-list">
+                  {% for item in summary_sections.open_questions %}
+                  <li>{{ item }}</li>
+                  {% endfor %}
+                </ul>
+              </div>
+              {% endif %}
+              {% if summary_sections.commitments %}
+              <div class="summary-section">
+                <h3>Commitments</h3>
+                <ul class="summary-list">
+                  {% for item in summary_sections.commitments %}
+                  <li>{{ item }}</li>
+                  {% endfor %}
+                </ul>
+              </div>
+              {% endif %}
+              {% if summary_sections.low_confidence_reason %}
+              <div class="summary-warning"><strong>Low-confidence note:</strong> {{ summary_sections.low_confidence_reason }}</div>
+              {% endif %}
+              {% if not summary_sections.has_content %}
+              <div class="summary-empty">No summary available yet.</div>
+              {% endif %}
+            </div>
           </div>
         </details>
       </section>
@@ -416,6 +517,36 @@
           });
         });
 })();
+</script>
+<script>
+      (() => {
+        const body = document.body;
+        const liveUrl = body.dataset.callLiveUrl;
+        const pollIntervalSeconds = Number(body.dataset.callLivePollInterval || "5");
+        const initialSignature = body.dataset.callLiveSignature || "";
+        const initiallyProcessing = body.dataset.callLiveProcessing === "true";
+        if (!liveUrl || !initiallyProcessing) return;
+
+        let reloadScheduled = false;
+
+        const refresh = async () => {
+          if (reloadScheduled) return;
+          try {
+            const response = await fetch(liveUrl, { headers: { "Accept": "application/json" } });
+            if (!response.ok) return;
+            const payload = await response.json();
+            const signatureChanged = Boolean(payload.signature) && payload.signature !== initialSignature;
+            if (!payload.is_processing && signatureChanged) {
+              reloadScheduled = true;
+              window.location.reload();
+            }
+          } catch (_error) {
+          }
+        };
+
+        refresh();
+        window.setInterval(refresh, pollIntervalSeconds * 1000);
+      })();
 </script>
     {% include "status_line_script.html" %}
   </body>

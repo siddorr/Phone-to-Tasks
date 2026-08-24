@@ -49,6 +49,7 @@ _LAST_STATUS_LINE_LOG: dict[str, object] = {"signature": None, "at": 0.0}
 DEFAULT_CALL_SORT_BY = "recorded_at"
 DEFAULT_CALL_SORT_DIRECTIONS = {
     "recorded_at": "desc",
+    "duration": "desc",
     "respondent": "asc",
     "state": "asc",
     "tasks": "desc",
@@ -64,6 +65,7 @@ ALLOWED_RECENT_FILTERS = {
 }
 
 STATUS_POLL_INTERVAL_SECONDS = 5
+CALL_DETAIL_POLL_INTERVAL_SECONDS = 5
 ETA_RECALC_MIN_SECONDS = 15.0
 ETA_RECALC_MAX_SECONDS = 300.0
 STAGE_DEFAULT_RUNTIME_SECONDS = {
@@ -178,6 +180,68 @@ def _summary_preview(summary: dict) -> str:
     return "No short summary."
 
 
+def _summary_sections(summary: dict) -> dict[str, object]:
+    payload = summary if isinstance(summary, dict) else {}
+
+    def clean_text(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    def clean_items(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        items: list[str] = []
+        for item in value:
+            normalized = clean_text(item)
+            if normalized:
+                items.append(normalized)
+        return items
+
+    short_summary = clean_text(payload.get("short_summary"))
+    detailed_summary = clean_text(payload.get("detailed_summary"))
+    key_points = clean_items(payload.get("key_points"))
+    decisions = clean_items(payload.get("decisions"))
+    open_questions = clean_items(payload.get("open_questions"))
+    commitments = clean_items(payload.get("commitments"))
+    low_confidence_reason = clean_text(payload.get("low_confidence_reason"))
+    analysis_language = clean_text(payload.get("analysis_language"))
+
+    analysis_confidence_raw = payload.get("analysis_confidence")
+    analysis_confidence: float | None = None
+    if isinstance(analysis_confidence_raw, (int, float)):
+        analysis_confidence = float(analysis_confidence_raw)
+
+    has_content = any(
+        [
+            short_summary,
+            detailed_summary,
+            key_points,
+            decisions,
+            open_questions,
+            commitments,
+            analysis_language,
+            analysis_confidence is not None,
+            low_confidence_reason,
+        ]
+    )
+
+    return {
+        "short_summary": short_summary,
+        "detailed_summary": detailed_summary,
+        "key_points": key_points,
+        "decisions": decisions,
+        "open_questions": open_questions,
+        "commitments": commitments,
+        "analysis_language": analysis_language,
+        "analysis_confidence": analysis_confidence,
+        "analysis_confidence_display": f"{analysis_confidence:.2f}" if analysis_confidence is not None else None,
+        "low_confidence_reason": low_confidence_reason,
+        "has_content": has_content,
+    }
+
+
 def _clean_transcript_preview(text: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()
@@ -284,6 +348,13 @@ def _transcription_quality_context(metadata: dict) -> dict[str, object]:
         "transcription_quality_score": metadata.get("transcription_quality_score"),
         "transcription_low_confidence_reason": metadata.get("transcription_low_confidence_reason"),
         "transcription_language_detected": metadata.get("transcription_language_detected"),
+        "transcription_backend_attempted": metadata.get("transcription_backend_attempted"),
+        "transcription_backend_selected": metadata.get("transcription_backend_selected") or metadata.get("transcription_backend"),
+        "transcription_backend_fallback_reason": metadata.get("transcription_backend_fallback_reason"),
+        "transcription_chunked_plausibility_score": metadata.get("transcription_chunked_plausibility_score"),
+        "transcription_chunked_plausibility_flags": metadata.get("transcription_chunked_plausibility_flags", []),
+        "transcription_uncertain_segment_count": metadata.get("transcription_uncertain_segment_count"),
+        "transcription_chunk_count": metadata.get("transcription_chunk_count"),
     }
 
 
@@ -326,6 +397,72 @@ def _call_queue_statuses(db, call_id: str) -> list[dict]:
         (call_id,),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _call_detail_signature(call_dir: Path, metadata: dict, queue_statuses: list[dict]) -> str:
+    tracked_files = (
+        "metadata.json",
+        "processing_log.json",
+        "transcript_segments.json",
+        "transcript_clean.txt",
+        "summary.json",
+        "tasks.json",
+        "tasks_reviewed.json",
+        "transcription_candidates.json",
+        "transcript_raw.json",
+        "transcript_vad_chunks.json",
+    )
+    file_versions = []
+    for name in tracked_files:
+        path = call_dir / name
+        version = path.stat().st_mtime_ns if path.exists() else 0
+        file_versions.append(f"{name}:{version}")
+    queue_versions = [
+        ":".join(
+            [
+                str(item.get("stage") or ""),
+                str(item.get("status") or ""),
+                str(item.get("started_at") or ""),
+                str(item.get("finished_at") or ""),
+            ]
+        )
+        for item in queue_statuses
+    ]
+    state_bits = [
+        str(metadata.get("current_state") or ""),
+        str(metadata.get("review_state") or ""),
+        str(metadata.get("last_blocking_stage") or ""),
+        str(metadata.get("last_blocking_error") or ""),
+    ]
+    return "|".join([*state_bits, *file_versions, *queue_versions])
+
+
+def _call_detail_refresh_payload(config: AppConfig, db, call_id: str, call_dir: Path) -> dict[str, object]:
+    metadata = read_json(call_dir / "metadata.json", default={})
+    queue_statuses = _call_queue_statuses(db, call_id)
+    active_statuses: list[str] = []
+    for item in queue_statuses:
+        status = str(item.get("status") or "")
+        normalized_status = status
+        if status == "running":
+            stale_row = {
+                "call_id": call_id,
+                "stage": item.get("stage"),
+                "status": status,
+                "started_at": item.get("started_at"),
+            }
+            if is_job_stale(config, stale_row):
+                normalized_status = "queued"
+        if normalized_status in {"queued", "running"}:
+            active_statuses.append(normalized_status)
+    return {
+        "call_id": call_id,
+        "current_state": metadata.get("current_state"),
+        "is_processing": bool(active_statuses),
+        "active_queue_statuses": active_statuses,
+        "signature": _call_detail_signature(call_dir, metadata, queue_statuses),
+        "poll_interval_seconds": CALL_DETAIL_POLL_INTERVAL_SECONDS,
+    }
 
 
 def _queue_counts(config: AppConfig, db) -> dict[str, int]:
@@ -631,6 +768,7 @@ def _compare_call_rows(left: dict, right: dict, sort_by: str, sort_dir: str) -> 
 
     sort_left = {
         "recorded_at": _effective_call_timestamp(left),
+        "duration": left.get("duration_seconds"),
         "respondent": (left.get("display_respondent") or "").casefold(),
         "state": (left.get("current_state") or "").casefold(),
         "tasks": left.get("display_task_count", 0),
@@ -638,6 +776,7 @@ def _compare_call_rows(left: dict, right: dict, sort_by: str, sort_dir: str) -> 
     }[sort_by]
     sort_right = {
         "recorded_at": _effective_call_timestamp(right),
+        "duration": right.get("duration_seconds"),
         "respondent": (right.get("display_respondent") or "").casefold(),
         "state": (right.get("current_state") or "").casefold(),
         "tasks": right.get("display_task_count", 0),
@@ -819,6 +958,11 @@ def create_app(config: AppConfig) -> FastAPI:
         _log_status_line_snapshot(payload)
         return payload
 
+    @app.get("/calls/{call_id}/live-status")
+    def call_live_status(call_id: str):
+        _, call_dir = _load_call(call_id)
+        return _call_detail_refresh_payload(config, db, call_id, call_dir)
+
     @app.get("/calls", response_class=HTMLResponse)
     def calls(
         request: Request,
@@ -882,32 +1026,48 @@ def create_app(config: AppConfig) -> FastAPI:
         )
 
     @app.post("/upload-audio")
-    async def upload_audio(audio_file: UploadFile = File(...)):
-        if not audio_file.filename:
+    async def upload_audio(audio_file: list[UploadFile] = File(...)):
+        files = [item for item in audio_file if item.filename]
+        if not files:
             raise HTTPException(status_code=400, detail="No file selected")
 
-        suffix = Path(audio_file.filename).suffix.lower()
         allowed_extensions = {item.lower() for item in config.section("ingest")["supported_extensions"]}
-        if suffix not in allowed_extensions:
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix or 'none'}")
+        unsupported = [Path(item.filename or "").suffix.lower() or "none" for item in files if Path(item.filename or "").suffix.lower() not in allowed_extensions]
+        if unsupported:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {unsupported[0]}")
 
-        incoming_path = config.incoming_folder / Path(audio_file.filename).name
-        if incoming_path.exists():
-            stem = incoming_path.stem
-            incoming_path = incoming_path.with_name(f"{stem}_{utc_now().replace(':', '').replace('-', '')}{suffix}")
+        imported_count = 0
+        skipped_count = 0
+        uploaded_names: list[str] = []
 
-        with incoming_path.open("wb") as handle:
-            shutil.copyfileobj(audio_file.file, handle)
-        file_size = incoming_path.stat().st_size
-        logger.info("Uploaded audio file name=%s path=%s size_bytes=%s", incoming_path.name, incoming_path, file_size)
+        for item in files:
+            suffix = Path(item.filename).suffix.lower()
+            incoming_path = config.incoming_folder / Path(item.filename).name
+            if incoming_path.exists():
+                stem = incoming_path.stem
+                incoming_path = incoming_path.with_name(f"{stem}_{utc_now().replace(':', '').replace('-', '')}{suffix}")
 
-        call_id = import_file(incoming_path, config)
-        if call_id:
-            logger.info("Upload import succeeded file=%s call_id=%s", incoming_path.name, call_id)
-            notice = f"Uploaded and imported {incoming_path.name}"
+            with incoming_path.open("wb") as handle:
+                shutil.copyfileobj(item.file, handle)
+            file_size = incoming_path.stat().st_size
+            uploaded_names.append(incoming_path.name)
+            logger.info("Uploaded audio file name=%s path=%s size_bytes=%s", incoming_path.name, incoming_path, file_size)
+
+            call_id = import_file(incoming_path, config)
+            if call_id:
+                imported_count += 1
+                logger.info("Upload import succeeded file=%s call_id=%s", incoming_path.name, call_id)
+            else:
+                skipped_count += 1
+                logger.info("Upload import skipped file=%s reason=duplicate_or_unstable", incoming_path.name)
+
+        if len(uploaded_names) == 1:
+            if imported_count == 1:
+                notice = f"Uploaded and imported {uploaded_names[0]}"
+            else:
+                notice = f"Uploaded {uploaded_names[0]}; import skipped because it is duplicate or unstable"
         else:
-            logger.info("Upload import skipped file=%s reason=duplicate_or_unstable", incoming_path.name)
-            notice = f"Uploaded {incoming_path.name}; import skipped because it is duplicate or unstable"
+            notice = f"Uploaded {len(uploaded_names)} files; imported {imported_count}, skipped {skipped_count}"
         return RedirectResponse(url=f"/calls?notice={notice}", status_code=303)
 
     @app.get("/calls/{call_id}", response_class=HTMLResponse)
@@ -919,6 +1079,7 @@ def create_app(config: AppConfig) -> FastAPI:
         raw_segments = read_json(call_dir / "transcript_segments.json", default=[])
         processing_log = read_json(call_dir / "processing_log.json", default=[])
         summary = read_json(call_dir / "summary.json", default={})
+        summary_sections = _summary_sections(summary)
         tasks = read_json(call_dir / "tasks.json", default=[])
         reviewed_tasks = read_json(call_dir / "tasks_reviewed.json", default=[])
         transcript_clean = (call_dir / "transcript_clean.txt").read_text(encoding="utf-8") if (call_dir / "transcript_clean.txt").exists() else ""
@@ -939,6 +1100,7 @@ def create_app(config: AppConfig) -> FastAPI:
         diarization_context = _diarization_context(processing_log, segments)
         speaker_identity_context = _speaker_identity_context(metadata, assignment_by_cluster)
         queue_statuses = _call_queue_statuses(db, call_id)
+        live_refresh = _call_detail_refresh_payload(config, db, call_id, call_dir)
         segment_cluster_ids = {
             item.get("speaker_cluster_id")
             for item in segments
@@ -949,6 +1111,7 @@ def create_app(config: AppConfig) -> FastAPI:
             "call": call,
             "metadata": metadata,
             "summary": summary,
+            "summary_sections": summary_sections,
             "summary_preview": _summary_preview(summary),
             "tasks": tasks,
             "task_list_preview": _task_list_preview(tasks),
@@ -977,6 +1140,7 @@ def create_app(config: AppConfig) -> FastAPI:
             "assignment_by_cluster": assignment_by_cluster,
             "cluster_status_label": _cluster_status_label,
             "queue_statuses": queue_statuses,
+            "call_live_refresh": live_refresh,
             **diarization_context,
             **speaker_identity_context,
             **_transcription_quality_context(metadata),
