@@ -18,6 +18,11 @@ SPEC.loader.exec_module(MODULE)
 
 from call_assistant.common.config import AppConfig
 from call_assistant.common.models import RawSegment, RawTranscript
+from call_assistant.transcription.service import (
+    PostBaselineRecoveryResult,
+    TranscriptCandidateComparison,
+    assess_transcript_quality,
+)
 
 
 class PostRussianRecoveryScriptTests(unittest.TestCase):
@@ -88,6 +93,35 @@ class PostRussianRecoveryScriptTests(unittest.TestCase):
         self.assertIn("phrase_windows", names)
         self.assertIn("phrase_context", names)
         self.assertIn("phrase_padding", names)
+        self.assertIn("clause_padding", names)
+        self.assertIn("full_call_hebrew_bias", names)
+
+    def test_generate_baseline_uses_chunked_backend_when_requested(self) -> None:
+        config = AppConfig.load(ROOT / "config.yaml")
+        audio_path = ROOT / "tests" / "dummy_audio.m4a"
+        expected = RawTranscript(provider="local", model="large-v3-turbo", language="ru", confidence=None, segments=[], text="baseline")
+
+        with patch.object(MODULE, "_transcribe_vad_chunked", return_value=expected) as chunked_mock:
+            baseline = MODULE.generate_baseline(
+                audio_path=audio_path,
+                config=config,
+                baseline_language="ru",
+                transcription_backend="vad_chunked_legacy",
+                transcription_provider="local",
+            )
+
+        self.assertIs(baseline, expected)
+        chunked_mock.assert_called_once()
+
+    def test_parse_args_accepts_benchmark_calls_flag(self) -> None:
+        argv = sys.argv[:]
+        try:
+            sys.argv = ["tune_post_russian_recovery.py", "--benchmark-calls"]
+            args = MODULE.parse_args()
+        finally:
+            sys.argv = argv
+
+        self.assertTrue(args.benchmark_calls)
 
     def test_run_variant_preserves_baseline_without_word_retries(self) -> None:
         baseline = RawTranscript(
@@ -100,26 +134,60 @@ class PostRussianRecoveryScriptTests(unittest.TestCase):
         )
         config = AppConfig.load(ROOT / "config.yaml")
         spec = MODULE.VariantSpec(name="current", overrides={})
+        comparison = TranscriptCandidateComparison(
+            baseline=baseline,
+            forced_hebrew=None,
+            merged=None,
+            winner="baseline",
+            strategy="baseline",
+            quality_notes=["Baseline candidate accepted without retry."],
+            selected=baseline,
+            baseline_assessment=assess_transcript_quality(baseline, ROOT / "tests" / "dummy_audio.m4a"),
+            forced_hebrew_assessment=None,
+            merged_assessment=None,
+            low_confidence_reason=None,
+        )
+        recovery = PostBaselineRecoveryResult(
+            selected=baseline,
+            strategy="baseline",
+            comparison=comparison,
+            baseline_assessment=comparison.baseline_assessment,
+            segment_decisions=[],
+            segment_detection_summary={},
+            segment_detection_llm_response=None,
+            word_span_candidates=[],
+            word_span_decisions=[],
+            word_span_detection_summary={},
+            word_span_detection_llm_response=None,
+            word_retry_candidates=[],
+            word_span_retry_results=[],
+            clause_retry_candidates=[],
+            clause_detection_summary={"candidates": []},
+            clause_retry_results=[],
+            word_span_validation_llm_response=[],
+            full_call_hebrew_escalated=False,
+            full_call_hebrew_selected=False,
+            full_call_hebrew_decision={"should_retry": False},
+        )
 
-        with (
-            patch.object(MODULE, "_segment_detection_decisions_with_raw", return_value=([], None)),
-            patch.object(MODULE, "_build_word_span_candidates", return_value=[]),
-            patch.object(MODULE, "_word_span_detection_decisions_with_raw", return_value=([], None)),
-            patch.object(MODULE, "_rank_word_retry_candidates", return_value=([], 0)),
-        ):
+        with patch.object(MODULE, "_run_post_baseline_recovery", return_value=recovery):
             result = MODULE.run_variant(
                 baseline,
                 ROOT / "tests" / "dummy_audio.m4a",
                 config,
                 spec,
                 "Алло.",
+                "whisper_legacy",
+                "local",
             )
 
         self.assertEqual(result.selected_strategy, "baseline")
         self.assertEqual(result.selected_text, "Алло.")
         self.assertEqual(result.selected_word_spans, 0)
+        self.assertEqual(result.selected_clause_candidates, 0)
         self.assertEqual(result.applied_replacements, 0)
         self.assertEqual(result.candidate_diagnostics, [])
+        self.assertEqual(result.clause_diagnostics, [])
 
     def test_write_report_includes_variant_metrics(self) -> None:
         baseline = RawTranscript(
@@ -149,7 +217,12 @@ class PostRussianRecoveryScriptTests(unittest.TestCase):
             suspicious_segments=2,
             suspicious_word_spans=4,
             selected_word_spans=2,
+            suspicious_clause_candidates=1,
+            selected_clause_candidates=1,
             applied_replacements=1,
+            applied_clause_replacements=1,
+            selection_notes=["Recovered budgeting clause."],
+            clause_diagnostics=[{"segment_index": 2, "clause_text": "его атомали, такцив", "score": 2.5, "status": "selected"}],
             candidate_diagnostics=[
                 {
                     "segment_index": 2,
@@ -161,6 +234,15 @@ class PostRussianRecoveryScriptTests(unittest.TestCase):
                 }
             ],
             word_span_retries=[],
+            clause_retry_results=[],
+            full_call_hebrew_escalated=False,
+            full_call_hebrew_selected=False,
+            full_call_hebrew_decision={"should_retry": False},
+            transcription_backend_attempted="whisper_legacy",
+            transcription_backend_selected="whisper_legacy",
+            transcription_backend_fallback_reason=None,
+            chunked_plausibility_score=None,
+            chunked_plausibility_flags=[],
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -172,6 +254,7 @@ class PostRussianRecoveryScriptTests(unittest.TestCase):
         self.assertIn("critical_phrase_f1=0.8889", text)
         self.assertIn("expected text", text)
         self.assertIn("candidate_ranks:", text)
+        self.assertIn("clause_candidates:", text)
         self.assertIn("\"span_text\": \"такцив Мульбецоа\"", text)
 
     def test_persist_reports_sorts_results_by_composite(self) -> None:
@@ -193,9 +276,23 @@ class PostRussianRecoveryScriptTests(unittest.TestCase):
             suspicious_segments=0,
             suspicious_word_spans=0,
             selected_word_spans=0,
+            suspicious_clause_candidates=0,
+            selected_clause_candidates=0,
             applied_replacements=0,
+            applied_clause_replacements=0,
+            selection_notes=[],
+            clause_diagnostics=[],
             candidate_diagnostics=[],
             word_span_retries=[],
+            clause_retry_results=[],
+            full_call_hebrew_escalated=False,
+            full_call_hebrew_selected=False,
+            full_call_hebrew_decision={"should_retry": False},
+            transcription_backend_attempted="whisper_legacy",
+            transcription_backend_selected="whisper_legacy",
+            transcription_backend_fallback_reason=None,
+            chunked_plausibility_score=None,
+            chunked_plausibility_flags=[],
         )
         better = MODULE.VariantResult(
             name="better",
@@ -207,9 +304,23 @@ class PostRussianRecoveryScriptTests(unittest.TestCase):
             suspicious_segments=0,
             suspicious_word_spans=0,
             selected_word_spans=0,
+            suspicious_clause_candidates=0,
+            selected_clause_candidates=0,
             applied_replacements=0,
+            applied_clause_replacements=0,
+            selection_notes=[],
+            clause_diagnostics=[],
             candidate_diagnostics=[],
             word_span_retries=[],
+            clause_retry_results=[],
+            full_call_hebrew_escalated=False,
+            full_call_hebrew_selected=False,
+            full_call_hebrew_decision={"should_retry": False},
+            transcription_backend_attempted="whisper_legacy",
+            transcription_backend_selected="whisper_legacy",
+            transcription_backend_fallback_reason=None,
+            chunked_plausibility_score=None,
+            chunked_plausibility_flags=[],
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -239,9 +350,23 @@ class PostRussianRecoveryScriptTests(unittest.TestCase):
             suspicious_segments=0,
             suspicious_word_spans=0,
             selected_word_spans=0,
+            suspicious_clause_candidates=0,
+            selected_clause_candidates=0,
             applied_replacements=0,
+            applied_clause_replacements=0,
+            selection_notes=[],
+            clause_diagnostics=[],
             candidate_diagnostics=[],
             word_span_retries=[],
+            clause_retry_results=[],
+            full_call_hebrew_escalated=False,
+            full_call_hebrew_selected=False,
+            full_call_hebrew_decision={"should_retry": False},
+            transcription_backend_attempted="whisper_legacy",
+            transcription_backend_selected="whisper_legacy",
+            transcription_backend_fallback_reason=None,
+            chunked_plausibility_score=None,
+            chunked_plausibility_flags=[],
         )
         better = MODULE.VariantResult(
             name="phrase_windows",
@@ -253,9 +378,23 @@ class PostRussianRecoveryScriptTests(unittest.TestCase):
             suspicious_segments=0,
             suspicious_word_spans=0,
             selected_word_spans=0,
+            suspicious_clause_candidates=0,
+            selected_clause_candidates=0,
             applied_replacements=0,
+            applied_clause_replacements=0,
+            selection_notes=[],
+            clause_diagnostics=[],
             candidate_diagnostics=[],
             word_span_retries=[],
+            clause_retry_results=[],
+            full_call_hebrew_escalated=False,
+            full_call_hebrew_selected=False,
+            full_call_hebrew_decision={"should_retry": False},
+            transcription_backend_attempted="whisper_legacy",
+            transcription_backend_selected="whisper_legacy",
+            transcription_backend_fallback_reason=None,
+            chunked_plausibility_score=None,
+            chunked_plausibility_flags=[],
         )
         call_result = MODULE.CallEvaluationResult(
             entry=MODULE.EvaluationManifestEntry(
@@ -300,6 +439,7 @@ class PostRussianRecoveryScriptTests(unittest.TestCase):
                 weighted_delta_composite_vs_baseline=0.0,
                 weighted_delta_phrase_f1_vs_baseline=0.0,
                 regression_flagged_calls=0,
+                fallback_count=0,
             )
         ]
 
@@ -310,6 +450,7 @@ class PostRussianRecoveryScriptTests(unittest.TestCase):
 
         self.assertEqual(payload["calls"][0]["call_id"], "call_a")
         self.assertEqual(payload["aggregate"]["ranked_variants"][0]["name"], "current")
+        self.assertEqual(payload["aggregate"]["ranked_variants"][0]["fallback_count"], 0)
 
 
 def json_dumps(payload: object) -> str:

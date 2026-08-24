@@ -1,0 +1,122 @@
+app:
+  name: call-assistant
+  environment: local
+paths:
+  incoming_folder: ./data/incoming
+  archive_root: /home/garik/CallAssistantData/calls
+  sqlite_path: ./data/index/call_assistant.db
+  logs_dir: ./data/logs
+  temp_dir: ./data/temp
+ingest:
+  supported_extensions:
+  - .wav
+  - .mp3
+  - .m4a
+  - .aac
+  - .flac
+  - .ogg
+  - .wma
+  stability_check_seconds: 2
+  stability_poll_interval_seconds: 1
+  file_hash_algorithm: sha256
+  scan_interval_seconds: 5
+queue:
+  worker_count: 1
+  stale_job_seconds: 300
+  transcription_stale_multiplier: 3
+  transcription_stale_buffer_seconds: 600
+  transcription_stale_min_seconds: 1800
+  retry_limits:
+    import: 2
+    audio_prepare: 2
+    transcription: 2
+    diarization: 2
+    transcript_clean: 2
+    analysis: 2
+    indexing: 2
+processing:
+  startup_mode: manual_step
+transcription:
+  provider_default: local
+  provider_fallback: null
+  local_model: large-v3-turbo
+  local_device: auto
+  cloud_enabled: true
+  cloud_model: whisper-1
+  language_hints:
+  - ru
+  - he
+  - en
+  language_mode: auto
+  force_language_for_single_language_calls: false
+  mixed_language_triggers:
+  - he
+  - ru
+  quality_retry_enabled: false
+  retry_languages_on_suspicion:
+  - he
+  suspicious_short_call_seconds: 20
+  suspicious_medium_call_seconds: 30
+  candidate_merge_enabled: true
+  chunked_plausibility_enabled: true
+  chunked_plausibility_min_score: 0.0
+  chunked_auto_fallback_to_legacy: false
+  vad_enabled: true
+  vad_min_silence_ms: 300
+  vad_min_chunk_ms: 5000
+  vad_merge_gap_ms: 250
+  vad_max_chunk_sec: 12
+segment_detection:
+  enabled: false
+  provider: openai
+  model: gpt-4.1-mini
+  run_on_every_call: true
+  timeout_sec: 45
+  max_retries: 2
+  max_segments_per_call: 200
+  context_window_segments: 2
+  max_retry_segments_per_call: 10
+  retry_language: he
+  min_confidence_to_retry: 0.0
+  continue_on_error: true
+  extraction_mode: word_span
+  max_candidate_spans_per_segment: 12
+  min_span_words: 1
+  max_span_words: 3
+  audio_span_padding_sec: 0.35
+  semantic_validation_enabled: true
+  semantic_validation_model: gpt-4.1-mini
+  semantic_validation_timeout_sec: 45
+  semantic_min_confidence_to_accept: 0.75
+  segment_reconciliation_enabled: true
+  segment_reconciliation_model: gpt-4.1-mini
+  clause_retry_enabled: true
+  clause_retry_min_span_words: 4
+  clause_retry_max_span_words: 8
+  clause_retry_audio_padding_sec: 0.65
+  clause_retry_max_per_call: 6
+diarization:
+  provider: pyannote
+  enabled: true
+  fallback_single_speaker: true
+  confidence_default: medium
+speaker_identity:
+  enabled: true
+  provider: pyannote
+  auto_assign_threshold: 0.75
+  suggest_threshold: 0.6
+  min_cluster_duration_seconds: 6
+  max_segments_per_cluster: 20
+  continue_on_error: true
+analysis:
+  enabled: true
+  provider: openai
+  model: gpt-4o-mini
+  summary_language: en
+  timeout_sec: 90
+  max_retries: 2
+ui:
+  host: 127.0.0.1
+  port: 8081
+logging:
+  level: INFO

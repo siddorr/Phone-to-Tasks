@@ -20,14 +20,11 @@ if str(SRC) not in sys.path:
 from call_assistant.common.config import AppConfig
 from call_assistant.common.models import RawTranscript
 from call_assistant.transcription.service import (
-    _apply_word_span_retries,
-    _build_word_span_candidates,
-    _rank_word_retry_candidates,
-    _word_span_candidate_score_map,
-    _segment_detection_decisions_with_raw,
+    _run_post_baseline_recovery,
+    _transcribe_cloud,
     _transcribe_local,
-    _word_span_detection_decisions_with_raw,
-    assess_transcript_quality,
+    _transcribe_vad_chunked,
+    _word_span_candidate_score_map,
 )
 
 
@@ -62,6 +59,7 @@ DEFAULT_EXPECTED_TRANSCRIPT = """
 
 DEFAULT_CALL_DIR = Path("/home/garik/CallAssistantData/calls/2026/04/04/call_20260404_164325_c124e9")
 DEFAULT_OUTPUT_DIR = ROOT / "data" / "reports"
+DEFAULT_MANIFEST = ROOT / "data" / "eval" / "post_russian_recovery" / "manifest.real.json"
 
 SPEAKER_LINE_RE = re.compile(r"^\[\d{2}:\d{2}\]\s+speaker_[^\n]+$", re.IGNORECASE)
 TIMESTAMP_PREFIX_RE = re.compile(r"^\[\d{2}:\d{2}\]\s+speaker_[^\n]+\s*")
@@ -105,9 +103,23 @@ class VariantResult:
     suspicious_segments: int
     suspicious_word_spans: int
     selected_word_spans: int
+    suspicious_clause_candidates: int
+    selected_clause_candidates: int
     applied_replacements: int
+    applied_clause_replacements: int
+    selection_notes: list[str]
+    clause_diagnostics: list[dict[str, Any]]
     candidate_diagnostics: list[dict[str, Any]]
     word_span_retries: list[dict[str, Any]]
+    clause_retry_results: list[dict[str, Any]]
+    full_call_hebrew_escalated: bool
+    full_call_hebrew_selected: bool
+    full_call_hebrew_decision: dict[str, Any]
+    transcription_backend_attempted: str | None
+    transcription_backend_selected: str | None
+    transcription_backend_fallback_reason: str | None
+    chunked_plausibility_score: float | None
+    chunked_plausibility_flags: list[str]
 
 
 @dataclass
@@ -142,6 +154,7 @@ class AggregateVariantResult:
     weighted_delta_composite_vs_baseline: float
     weighted_delta_phrase_f1_vs_baseline: float
     regression_flagged_calls: int
+    fallback_count: int
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -256,6 +269,32 @@ def build_default_variants() -> list[VariantSpec]:
         VariantSpec(
             "phrase_padding",
             {"segment_detection": {"audio_span_padding_sec": 0.50, "min_span_words": 2, "max_span_words": 5, "max_candidate_spans_per_segment": 20}},
+        ),
+        VariantSpec(
+            "clause_padding",
+            {"segment_detection": {"clause_retry_audio_padding_sec": 0.90}},
+        ),
+        VariantSpec(
+            "clause_context",
+            {
+                "segment_detection": {
+                    "context_window_segments": 2,
+                    "clause_retry_audio_padding_sec": 0.90,
+                    "min_span_words": 2,
+                    "max_span_words": 5,
+                    "max_candidate_spans_per_segment": 20,
+                }
+            },
+        ),
+        VariantSpec(
+            "full_call_hebrew_bias",
+            {
+                "segment_detection": {
+                    "full_call_hebrew_score_threshold": 0.55,
+                    "full_call_hebrew_min_suspicious_segments": 2,
+                    "full_call_hebrew_suspicious_ratio_threshold": 0.40,
+                }
+            },
         ),
         VariantSpec(
             "no_reconcile",
@@ -399,87 +438,88 @@ def run_variant(
     base_config: AppConfig,
     spec: VariantSpec,
     expected_text: str,
+    transcription_backend: str,
+    transcription_provider: str,
 ) -> VariantResult:
     started = time.perf_counter()
     config = variant_config(base_config, spec.overrides)
-    decisions, _ = _segment_detection_decisions_with_raw(baseline, audio_path, config)
-    word_span_candidates = _build_word_span_candidates(baseline, decisions, config)
-    word_span_decisions, _ = _word_span_detection_decisions_with_raw(word_span_candidates, config)
-    score_map = _word_span_candidate_score_map(word_span_candidates, word_span_decisions)
-    word_retry_candidates, _ = _rank_word_retry_candidates(word_span_candidates, word_span_decisions, config)
-    threshold_used = float(config.section("segment_detection").get("min_confidence_to_retry", 0.70))
-    selected_keys = {
-        (item.segment_index, item.start_token_index, item.end_token_index)
-        for item in word_retry_candidates
-    }
-    candidate_diagnostics: list[dict[str, Any]] = []
-    for decision in word_span_decisions:
-        if not decision.suspicious:
-            continue
-        key = (decision.segment_index, decision.start_token_index, decision.end_token_index)
-        if key in selected_keys:
-            status = "selected"
-        elif decision.confidence < threshold_used:
-            status = "below_threshold"
-        else:
-            status = "filtered_after_ranking"
-        candidate_diagnostics.append(
-            {
-                "segment_index": decision.segment_index,
-                "span_text": decision.span_text,
-                "start_token_index": decision.start_token_index,
-                "end_token_index": decision.end_token_index,
-                "score": round(score_map.get(key, 0.0), 4),
-                "confidence": round(decision.confidence, 4),
-                "label": decision.label,
-                "retry_language": decision.retry_language,
-                "status": status,
-                "reason": decision.reason,
-            }
-        )
-    candidate_diagnostics.sort(
-        key=lambda item: (
-            -float(item["score"]),
-            -float(item["confidence"]),
-            int(item["segment_index"]),
-            int(item["start_token_index"]),
-        )
+    recovery = _run_post_baseline_recovery(
+        baseline,
+        audio_path,
+        config,
+        provider=transcription_provider,
+        model_override=None,
+        language_override="ru",
+        retry_enabled=True,
+        retry_languages=list(config.section("transcription").get("retry_languages_on_suspicion", ["he"])),
+        merge_enabled=bool(config.section("transcription").get("candidate_merge_enabled", True)),
+        full_call_retry=lambda: generate_baseline(
+            audio_path=audio_path,
+            config=config,
+            baseline_language="he",
+            transcription_backend=transcription_backend,
+            transcription_provider=transcription_provider,
+        ),
     )
-    selected: RawTranscript = baseline
-    strategy = "baseline"
-    word_span_retry_results: list[dict[str, Any]] = []
-    if word_retry_candidates:
-        merged, word_span_retry_results, _ = _apply_word_span_retries(
-            baseline,
-            audio_path,
-            config,
-            word_retry_candidates,
-            model_override=base_config.section("transcription").get("local_model"),
-        )
-        baseline_assessment = assess_transcript_quality(baseline, audio_path)
-        merged_assessment = assess_transcript_quality(merged, audio_path)
-        replaced_count = sum(1 for item in word_span_retry_results if item.get("replacement_applied"))
-        merged_has_hebrew = bool(re.search(r"[\u0590-\u05FF]", merged.text))
-        if merged.text != baseline.text and (
-            merged_assessment.score >= baseline_assessment.score - 0.05
-            or (replaced_count > 0 and merged_has_hebrew)
-        ):
-            selected = merged
-            strategy = "llm_word_span_hebrew_recovery"
-    scores = compute_match_scores(selected.text, expected_text)
+    score_map = _word_span_candidate_score_map(recovery.word_span_candidates, recovery.word_span_decisions)
+    scores = compute_match_scores(recovery.selected.text, expected_text)
     return VariantResult(
         name=spec.name,
         overrides=spec.overrides,
         elapsed_seconds=time.perf_counter() - started,
-        selected_strategy=strategy,
-        selected_text=selected.text,
+        selected_strategy=recovery.strategy,
+        selected_text=recovery.selected.text,
         scores=scores,
-        suspicious_segments=sum(1 for item in decisions if item.suspicious),
-        suspicious_word_spans=sum(1 for item in word_span_decisions if item.suspicious),
-        selected_word_spans=len(word_retry_candidates),
-        applied_replacements=sum(1 for item in word_span_retry_results if item.get("replacement_applied")),
-        candidate_diagnostics=candidate_diagnostics,
-        word_span_retries=word_span_retry_results,
+        suspicious_segments=sum(1 for item in recovery.segment_decisions if item.suspicious),
+        suspicious_word_spans=sum(1 for item in recovery.word_span_decisions if item.suspicious),
+        selected_word_spans=len(recovery.word_retry_candidates),
+        suspicious_clause_candidates=len(recovery.clause_retry_candidates),
+        selected_clause_candidates=len(recovery.clause_retry_candidates),
+        applied_replacements=sum(1 for item in recovery.word_span_retry_results if item.get("replacement_applied"))
+        + sum(1 for item in recovery.clause_retry_results if item.get("replacement_applied")),
+        applied_clause_replacements=sum(1 for item in recovery.clause_retry_results if item.get("replacement_applied")),
+        selection_notes=list(recovery.comparison.quality_notes),
+        clause_diagnostics=list(recovery.clause_detection_summary.get("candidates", [])),
+        candidate_diagnostics=[
+            {
+                "segment_index": item.segment_index,
+                "span_text": item.span_text,
+                "start_token_index": item.start_token_index,
+                "end_token_index": item.end_token_index,
+                "score": round(
+                    score_map.get((item.segment_index, item.start_token_index, item.end_token_index), 0.0),
+                    4,
+                ),
+                "confidence": round(item.confidence, 4),
+                "label": item.label,
+                "retry_language": item.retry_language,
+                "status": (
+                    "selected"
+                    if any(
+                        candidate.segment_index == item.segment_index
+                        and candidate.start_token_index == item.start_token_index
+                        and candidate.end_token_index == item.end_token_index
+                        for candidate in recovery.word_retry_candidates
+                    )
+                    else "below_threshold"
+                    if item.confidence < float(config.section("segment_detection").get("min_confidence_to_retry", 0.70))
+                    else "filtered_after_ranking"
+                ),
+                "reason": item.reason,
+            }
+            for item in recovery.word_span_decisions
+            if item.suspicious
+        ],
+        word_span_retries=recovery.word_span_retry_results,
+        clause_retry_results=recovery.clause_retry_results,
+        full_call_hebrew_escalated=recovery.full_call_hebrew_escalated,
+        full_call_hebrew_selected=recovery.full_call_hebrew_selected,
+        full_call_hebrew_decision=recovery.full_call_hebrew_decision,
+        transcription_backend_attempted=baseline.backend_attempted,
+        transcription_backend_selected=baseline.backend_selected,
+        transcription_backend_fallback_reason=baseline.backend_fallback_reason,
+        chunked_plausibility_score=baseline.chunked_plausibility_score,
+        chunked_plausibility_flags=list(baseline.chunked_plausibility_flags or []),
     )
 
 
@@ -514,14 +554,30 @@ def write_report(
         )
         lines.append(f"   strategy={result.selected_strategy} elapsed_seconds={result.elapsed_seconds:.2f}")
         lines.append(
-            f"   suspicious_segments={result.suspicious_segments} suspicious_word_spans={result.suspicious_word_spans} selected_word_spans={result.selected_word_spans} applied_replacements={result.applied_replacements}"
+            f"   suspicious_segments={result.suspicious_segments} suspicious_word_spans={result.suspicious_word_spans} selected_word_spans={result.selected_word_spans} suspicious_clause_candidates={result.suspicious_clause_candidates} selected_clause_candidates={result.selected_clause_candidates} applied_replacements={result.applied_replacements} applied_clause_replacements={result.applied_clause_replacements}"
         )
         lines.append(f"   overrides={json.dumps(result.overrides, ensure_ascii=False, sort_keys=True)}")
         lines.append(f"   text={result.selected_text}")
+        lines.append(f"   selection_notes={json.dumps(result.selection_notes, ensure_ascii=False)}")
+        lines.append(
+            "   full_call_hebrew="
+            + json.dumps(
+                {
+                    "escalated": result.full_call_hebrew_escalated,
+                    "selected": result.full_call_hebrew_selected,
+                    "decision": result.full_call_hebrew_decision,
+                },
+                ensure_ascii=False,
+            )
+        )
         lines.append(
             "   critical_phrases_hit="
             + json.dumps([phrase for phrase in CRITICAL_EXPECTED_PHRASES if phrase in result.selected_text], ensure_ascii=False)
         )
+        if result.clause_diagnostics:
+            lines.append("   clause_candidates:")
+            for candidate in result.clause_diagnostics:
+                lines.append("   - " + json.dumps(candidate, ensure_ascii=False))
         if result.candidate_diagnostics:
             lines.append("   candidate_ranks:")
             for candidate in result.candidate_diagnostics:
@@ -556,6 +612,23 @@ def write_report(
                         ensure_ascii=False,
                     )
                 )
+        if result.clause_retry_results:
+            lines.append("   clause_retries:")
+            for retry in result.clause_retry_results:
+                lines.append(
+                    "   - "
+                    + json.dumps(
+                        {
+                            "clause_text": retry.get("clause_text") or retry.get("span_text"),
+                            "retry_text": retry.get("retry_text"),
+                            "normalized_hebrew": retry.get("normalized_hebrew"),
+                            "final_replacement_text": retry.get("final_replacement_text"),
+                            "replacement_applied": retry.get("replacement_applied"),
+                            "replacement_reason": retry.get("replacement_reason"),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
         lines.append("")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
@@ -577,9 +650,18 @@ def write_json_report(output_path: Path, call_dir: Path, baseline: RawTranscript
                 "suspicious_segments": result.suspicious_segments,
                 "suspicious_word_spans": result.suspicious_word_spans,
                 "selected_word_spans": result.selected_word_spans,
+                "suspicious_clause_candidates": result.suspicious_clause_candidates,
+                "selected_clause_candidates": result.selected_clause_candidates,
                 "applied_replacements": result.applied_replacements,
+                "applied_clause_replacements": result.applied_clause_replacements,
+                "selection_notes": result.selection_notes,
+                "clause_diagnostics": result.clause_diagnostics,
                 "candidate_diagnostics": result.candidate_diagnostics,
                 "word_span_retries": result.word_span_retries,
+                "clause_retry_results": result.clause_retry_results,
+                "full_call_hebrew_escalated": result.full_call_hebrew_escalated,
+                "full_call_hebrew_selected": result.full_call_hebrew_selected,
+                "full_call_hebrew_decision": result.full_call_hebrew_decision,
             }
             for result in results
         ],
@@ -607,29 +689,98 @@ def evaluate_call(
     config: AppConfig,
     specs: list[VariantSpec],
     baseline_language: str,
+    transcription_backend: str,
+    transcription_provider: str,
 ) -> CallEvaluationResult:
     try:
         call_dir = entry.call_dir or _find_call_dir(config, entry.call_id)
         audio_path = resolve_audio_path(call_dir)
         expected_text, _ = load_expected_case(entry)
-        baseline = _transcribe_local(
-            audio_path,
-            config,
-            model_override=config.section("transcription").get("local_model"),
-            language_override=baseline_language,
-            language_mode="metadata_override",
+        baseline = generate_baseline(
+            audio_path=audio_path,
+            config=config,
+            baseline_language=baseline_language,
+            transcription_backend=transcription_backend,
+            transcription_provider=transcription_provider,
         )
-        variants = [run_variant(baseline, audio_path, config, spec, expected_text) for spec in specs]
+        variants = [
+            run_variant(
+                baseline,
+                audio_path,
+                config,
+                spec,
+                expected_text,
+                transcription_backend,
+                transcription_provider,
+            )
+            for spec in specs
+        ]
         return CallEvaluationResult(entry=entry, baseline=baseline, expected_text=expected_text, variants=variants)
     except Exception as exc:
         return CallEvaluationResult(entry=entry, baseline=None, expected_text=None, variants=[], error=str(exc))
 
 
+def baseline_config(config: AppConfig, transcription_backend: str, transcription_provider: str) -> AppConfig:
+    cloned = AppConfig(data=copy.deepcopy(config.data), root_dir=config.root_dir)
+    cloned.data.setdefault("transcription", {})
+    cloned.data["transcription"]["backend"] = transcription_backend
+    cloned.data["transcription"]["provider_default"] = transcription_provider
+    return cloned
+
+
+def generate_baseline(
+    audio_path: Path,
+    config: AppConfig,
+    baseline_language: str,
+    transcription_backend: str,
+    transcription_provider: str,
+) -> RawTranscript:
+    effective = baseline_config(config, transcription_backend, transcription_provider)
+    if transcription_provider == "local":
+        if transcription_backend == "whisper_legacy":
+            return _transcribe_local(
+                audio_path,
+                effective,
+                model_override=effective.section("transcription").get("local_model"),
+                language_override=baseline_language,
+                language_mode="metadata_override",
+            )
+        if transcription_backend in {"vad_chunked_legacy", "faster_whisper_vad"}:
+            return _transcribe_vad_chunked(
+                audio_path,
+                effective,
+                provider="local",
+                model_override=effective.section("transcription").get("local_model"),
+                language_override=baseline_language,
+                language_mode="metadata_override",
+            )
+        raise ValueError(f"Unsupported transcription backend: {transcription_backend}")
+    if transcription_provider == "cloud":
+        if transcription_backend == "whisper_legacy":
+            return _transcribe_cloud(
+                audio_path,
+                effective,
+                model_override=effective.section("transcription").get("cloud_model"),
+                language_override=baseline_language,
+                language_mode="metadata_override",
+            )
+        if transcription_backend in {"vad_chunked_legacy", "faster_whisper_vad"}:
+            return _transcribe_vad_chunked(
+                audio_path,
+                effective,
+                provider="cloud",
+                model_override=effective.section("transcription").get("cloud_model"),
+                language_override=baseline_language,
+                language_mode="metadata_override",
+            )
+        raise ValueError(f"Unsupported transcription backend: {transcription_backend}")
+    raise ValueError(f"Unsupported transcription provider: {transcription_provider}")
+
+
 def _regression_flag(baseline: VariantResult, candidate: VariantResult) -> bool:
-    composite_improvement = candidate.scores.composite - baseline.scores.composite
-    token_precision_delta = candidate.scores.token_precision - baseline.scores.token_precision
-    phrase_recall_delta = candidate.scores.critical_phrase_recall - baseline.scores.critical_phrase_recall
-    return composite_improvement < 0.01 and (token_precision_delta <= -0.05 or phrase_recall_delta <= -0.10)
+    composite_delta = candidate.scores.composite - baseline.scores.composite
+    lost_phrase_recall = candidate.scores.critical_phrase_recall < baseline.scores.critical_phrase_recall
+    return composite_delta < -0.03 or lost_phrase_recall
 
 
 def aggregate_variant_results(call_results: list[CallEvaluationResult]) -> list[AggregateVariantResult]:
@@ -653,6 +804,7 @@ def aggregate_variant_results(call_results: list[CallEvaluationResult]) -> list[
                     "weighted_delta_phrase_f1_vs_baseline": 0.0,
                     "success_count": 0.0,
                     "regression_flagged_calls": 0.0,
+                    "fallback_count": 0.0,
                 },
             )
             bucket["weight_total"] += weight
@@ -665,6 +817,9 @@ def aggregate_variant_results(call_results: list[CallEvaluationResult]) -> list[
                 variant.scores.critical_phrase_f1 - baseline.scores.critical_phrase_f1
             ) * weight
             bucket["success_count"] += 1
+            if variant.transcription_backend_attempted and variant.transcription_backend_selected:
+                if variant.transcription_backend_attempted != variant.transcription_backend_selected:
+                    bucket["fallback_count"] += 1
             if variant.name != baseline.name and _regression_flag(baseline, variant):
                 bucket["regression_flagged_calls"] += 1
     aggregate: list[AggregateVariantResult] = []
@@ -682,6 +837,7 @@ def aggregate_variant_results(call_results: list[CallEvaluationResult]) -> list[
                 weighted_delta_composite_vs_baseline=bucket["weighted_delta_composite_vs_baseline"] / weight_total,
                 weighted_delta_phrase_f1_vs_baseline=bucket["weighted_delta_phrase_f1_vs_baseline"] / weight_total,
                 regression_flagged_calls=int(bucket["regression_flagged_calls"]),
+                fallback_count=int(bucket["fallback_count"]),
             )
         )
     return sorted(
@@ -722,7 +878,8 @@ def write_aggregate_text_report(
         lines.append(
             f"   delta_composite_vs_baseline={item.weighted_delta_composite_vs_baseline:.4f} "
             f"delta_phrase_f1_vs_baseline={item.weighted_delta_phrase_f1_vs_baseline:.4f} "
-            f"regression_flagged_calls={item.regression_flagged_calls}"
+            f"regression_flagged_calls={item.regression_flagged_calls} "
+            f"fallback_count={item.fallback_count}"
         )
         lines.append(f"   success_count={item.success_count} failure_count={item.failure_count}")
         lines.append("")
@@ -742,6 +899,12 @@ def write_aggregate_text_report(
             f"baseline={baseline.scores.composite:.4f} "
             f"delta={best.scores.composite - baseline.scores.composite:.4f}"
         )
+        if best.transcription_backend_attempted or best.transcription_backend_selected:
+            lines.append(
+                f"  backend_attempted={best.transcription_backend_attempted} "
+                f"backend_selected={best.transcription_backend_selected} "
+                f"fallback_reason={best.transcription_backend_fallback_reason}"
+            )
         if entry.description:
             lines.append(f"  description={entry.description}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -781,9 +944,23 @@ def write_aggregate_json_report(
                         "suspicious_segments": result.suspicious_segments,
                         "suspicious_word_spans": result.suspicious_word_spans,
                         "selected_word_spans": result.selected_word_spans,
+                        "suspicious_clause_candidates": result.suspicious_clause_candidates,
+                        "selected_clause_candidates": result.selected_clause_candidates,
                         "applied_replacements": result.applied_replacements,
+                        "applied_clause_replacements": result.applied_clause_replacements,
+                        "selection_notes": result.selection_notes,
+                        "transcription_backend_attempted": result.transcription_backend_attempted,
+                        "transcription_backend_selected": result.transcription_backend_selected,
+                        "transcription_backend_fallback_reason": result.transcription_backend_fallback_reason,
+                        "chunked_plausibility_score": result.chunked_plausibility_score,
+                        "chunked_plausibility_flags": result.chunked_plausibility_flags,
+                        "clause_diagnostics": result.clause_diagnostics,
                         "candidate_diagnostics": result.candidate_diagnostics,
                         "word_span_retries": result.word_span_retries,
+                        "clause_retry_results": result.clause_retry_results,
+                        "full_call_hebrew_escalated": result.full_call_hebrew_escalated,
+                        "full_call_hebrew_selected": result.full_call_hebrew_selected,
+                        "full_call_hebrew_decision": result.full_call_hebrew_decision,
                     }
                     for result in item.variants
                 ],
@@ -804,7 +981,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-file", type=Path, help="Optional file with expected transcript text; speaker/timestamp lines are stripped")
     parser.add_argument("--output", type=Path, help="Optional text report path")
     parser.add_argument("--json-output", type=Path, help="Optional JSON report path")
-    parser.add_argument("--manifest", type=Path, help="Optional evaluation manifest for multi-call offline tuning")
+    parser.add_argument("--manifest", type=Path, help=f"Optional evaluation manifest for multi-call offline tuning (default benchmark set: {DEFAULT_MANIFEST})")
     parser.add_argument("--output-dir", type=Path, help="Directory for aggregate and per-call reports in manifest mode")
     parser.add_argument("--call-id", action="append", default=[], help="Optional call_id filter for manifest mode; repeatable")
     parser.add_argument("--variant", action="append", default=[], help="Optional variant name filter; repeatable")
@@ -813,6 +990,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-only", action="store_true", help="Only evaluate the current baseline variant")
     parser.add_argument("--compare-to", type=Path, help="Optional previous aggregate JSON report to compare manually later")
     parser.add_argument("--baseline-language", default="ru", help="Language forced for the one-time baseline transcription")
+    parser.add_argument(
+        "--transcription-backend",
+        choices=["whisper_legacy", "vad_chunked_legacy", "faster_whisper_vad"],
+        default="whisper_legacy",
+        help="Baseline transcription backend used before running recovery variants",
+    )
+    parser.add_argument(
+        "--transcription-provider",
+        choices=["local", "cloud"],
+        default="local",
+        help="Baseline transcription provider used before running recovery variants",
+    )
+    parser.add_argument(
+        "--benchmark-calls",
+        action="store_true",
+        help="Run manifest mode against the default benchmark call set",
+    )
     return parser.parse_args()
 
 
@@ -820,9 +1014,12 @@ def main() -> int:
     args = parse_args()
     config = AppConfig.load(ROOT / "config.yaml")
     specs = select_variants(build_default_variants(), args.variant, args.baseline_only)
+    manifest_arg = args.manifest
+    if args.benchmark_calls and manifest_arg is None:
+        manifest_arg = DEFAULT_MANIFEST
 
-    if args.manifest:
-        manifest_path = args.manifest.resolve()
+    if manifest_arg:
+        manifest_path = manifest_arg.resolve()
         entries = load_manifest(manifest_path, config)
         if args.call_id:
             allowed = set(args.call_id)
@@ -838,7 +1035,14 @@ def main() -> int:
         try:
             for index, entry in enumerate(entries, start=1):
                 print(f"[{index}/{len(entries)}] Evaluating call: {entry.call_id}", flush=True)
-                result = evaluate_call(entry, config, specs, args.baseline_language)
+                result = evaluate_call(
+                    entry,
+                    config,
+                    specs,
+                    args.baseline_language,
+                    args.transcription_backend,
+                    args.transcription_provider,
+                )
                 results.append(result)
                 if result.error:
                     print(f"[{index}/{len(entries)}] Failed {entry.call_id}: {result.error}", flush=True)
@@ -893,12 +1097,12 @@ def main() -> int:
     call_dir = args.call_dir.resolve()
     audio_path = resolve_audio_path(call_dir)
     expected_text = expected_text_from_args(args.expected_file)
-    baseline = _transcribe_local(
-        audio_path,
-        config,
-        model_override=config.section("transcription").get("local_model"),
-        language_override=args.baseline_language,
-        language_mode="metadata_override",
+    baseline = generate_baseline(
+        audio_path=audio_path,
+        config=config,
+        baseline_language=args.baseline_language,
+        transcription_backend=args.transcription_backend,
+        transcription_provider=args.transcription_provider,
     )
     stem = f"post_russian_recovery_tuning_{call_dir.name}"
     text_output = args.output or (DEFAULT_OUTPUT_DIR / f"{stem}.txt")
@@ -906,12 +1110,24 @@ def main() -> int:
     text_output.parent.mkdir(parents=True, exist_ok=True)
     json_output.parent.mkdir(parents=True, exist_ok=True)
     results: list[VariantResult] = []
-    print(f"Baseline ready: provider={baseline.provider} model={baseline.model} language={baseline.language}", flush=True)
+    print(
+        f"Baseline ready: provider={baseline.provider} model={baseline.model} language={baseline.language} "
+        f"backend={args.transcription_backend}",
+        flush=True,
+    )
     print(f"Testing {len(specs)} variants", flush=True)
     try:
         for index, spec in enumerate(specs, start=1):
             print(f"[{index}/{len(specs)}] Running variant: {spec.name}", flush=True)
-            result = run_variant(baseline, audio_path, config, spec, expected_text)
+            result = run_variant(
+                baseline,
+                audio_path,
+                config,
+                spec,
+                expected_text,
+                args.transcription_backend,
+                args.transcription_provider,
+            )
             results.append(result)
             ranked = persist_reports(text_output, json_output, call_dir, baseline, expected_text, results)
             print(
@@ -921,7 +1137,8 @@ def main() -> int:
                 f"token_f1={result.scores.token_f1:.4f} "
                 f"critical_phrase_f1={result.scores.critical_phrase_f1:.4f} "
                 f"strategy={result.selected_strategy} "
-                f"replacements={result.applied_replacements}",
+                f"replacements={result.applied_replacements} "
+                f"clause_replacements={result.applied_clause_replacements}",
                 flush=True,
             )
             print(f"Partial reports updated: {text_output} | {json_output}", flush=True)
